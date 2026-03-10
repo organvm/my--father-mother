@@ -1,0 +1,12 @@
+schema_version: '1.0'
+repo: my--father-mother
+organ: III
+display_name: Local-only clipboard long-term memory for macOS with FTS5 search, semantic
+  embeddings, federation, and browser integration
+delivery:
+- platform: web_app
+  status: not_started
+revenue:
+- platform: one-time
+  status: planned
+  priority: critical
