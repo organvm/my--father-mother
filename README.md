@@ -152,6 +152,10 @@ python3 main.py init
 python3 main.py watch --cap 5000
 # => [mother|moon] watching clipboard (cap=5000, interval=1.0s)
 
+# Start the local HTTP API and web UI (Father)
+python3 main.py serve --port 8765
+# => [father|sun] serving API on http://127.0.0.1:8765
+
 # In another terminal, query your clips (Father)
 python3 main.py recent --limit 10
 python3 main.py search "docker env" --limit 5

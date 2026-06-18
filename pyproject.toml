@@ -1,3 +1,15 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[project]
+name = "my-father-mother"
+version = "0.1.0"
+description = "Local-first clipboard memory daemon and API for macOS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[project.scripts]
+mfm = "main:cli"
+my-father-mother = "main:cli"
