@@ -155,7 +155,11 @@ def toast(title: str, text: str) -> None:
     try:
         # Avoid escaping woes by passing via -e arguments separately.
         subprocess.run(
-            ["osascript", "-e", f'display notification "{text_safe}" with title "{title_safe}"'],
+            [
+                "osascript",
+                "-e",
+                f'display notification "{text_safe}" with title "{title_safe}"',
+            ],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -180,8 +184,7 @@ def column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS clips (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -223,8 +226,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             app TEXT UNIQUE NOT NULL
         );
-        """
-    )
+        """)
     # migrations
     if not column_exists(conn, "clips", "pinned"):
         conn.execute("ALTER TABLE clips ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
@@ -234,21 +236,22 @@ def init_db(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE clips ADD COLUMN file_path TEXT")
     if not column_exists(conn, "clips", "lang"):
         conn.execute("ALTER TABLE clips ADD COLUMN lang TEXT DEFAULT 'unk'")
-    conn.execute(
-        """
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS clip_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             clip_id INTEGER NOT NULL,
             seen_at TEXT NOT NULL,
             FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
         );
-        """
+        """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clip_events_clip ON clip_events(clip_id)"
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_clip_events_clip ON clip_events(clip_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_clip_events_seen ON clip_events(seen_at)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clip_events_seen ON clip_events(seen_at)"
+    )
 
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS clip_vectors (
             clip_id INTEGER PRIMARY KEY,
             dim INTEGER NOT NULL,
@@ -256,13 +259,13 @@ def init_db(conn: sqlite3.Connection) -> None:
             model TEXT NOT NULL DEFAULT 'hash',
             FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
         );
-        """
-    )
+        """)
     if not column_exists(conn, "clip_vectors", "model"):
-        conn.execute("ALTER TABLE clip_vectors ADD COLUMN model TEXT NOT NULL DEFAULT 'hash'")
+        conn.execute(
+            "ALTER TABLE clip_vectors ADD COLUMN model TEXT NOT NULL DEFAULT 'hash'"
+        )
 
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL
@@ -276,10 +279,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_clip_tags_clip ON clip_tags(clip_id);
         CREATE INDEX IF NOT EXISTS idx_clip_tags_tag ON clip_tags(tag_id);
-        """
-    )
-    conn.executescript(
-        """
+        """)
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS clip_notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             clip_id INTEGER NOT NULL,
@@ -288,10 +289,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             FOREIGN KEY (clip_id) REFERENCES clips(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_clip_notes_clip ON clip_notes(clip_id);
-        """
-    )
-    conn.executescript(
-        """
+        """)
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS copilot_chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
@@ -300,19 +299,16 @@ def init_db(conn: sqlite3.Connection) -> None:
             content TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_copilot_chats_created ON copilot_chats(created_at);
-        """
-    )
+        """)
     # license gate: track distinct devices for per-tier device caps
-    conn.executescript(
-        """
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS devices (
             device_id TEXT PRIMARY KEY,
             hostname TEXT,
             first_seen TEXT NOT NULL,
             last_seen TEXT NOT NULL
         );
-        """
-    )
+        """)
     # seed the license tier so `config --get license_type` is meaningful on fresh DBs
     cur = conn.execute("SELECT 1 FROM settings WHERE key = 'license_type'")
     if cur.fetchone() is None:
@@ -366,12 +362,16 @@ def frontmost_app_and_window() -> Tuple[str, str]:
 
 # ---------- Persistence helpers ----------
 def clip_exists(conn: sqlite3.Connection, digest: str) -> bool:
-    cur = conn.execute("SELECT 1 FROM clips WHERE hash = ? ORDER BY id DESC LIMIT 1", (digest,))
+    cur = conn.execute(
+        "SELECT 1 FROM clips WHERE hash = ? ORDER BY id DESC LIMIT 1", (digest,)
+    )
     return cur.fetchone() is not None
 
 
 def get_clip_id_by_hash(conn: sqlite3.Connection, digest: str) -> Optional[int]:
-    cur = conn.execute("SELECT id FROM clips WHERE hash = ? ORDER BY id DESC LIMIT 1", (digest,))
+    cur = conn.execute(
+        "SELECT id FROM clips WHERE hash = ? ORDER BY id DESC LIMIT 1", (digest,)
+    )
     row = cur.fetchone()
     return row["id"] if row else None
 
@@ -435,7 +435,17 @@ def insert_clip_import(
         INSERT INTO clips (created_at, source_app, window_title, content, hash, title, pinned, file_path, lang)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (created, app, window, clean, digest, title, 1 if pinned else 0, file_path, lang_val),
+        (
+            created,
+            app,
+            window,
+            clean,
+            digest,
+            title,
+            1 if pinned else 0,
+            file_path,
+            lang_val,
+        ),
     )
     conn.commit()
     clip_id = cur.lastrowid
@@ -646,9 +656,7 @@ def evict_if_needed(conn: sqlite3.Connection, max_db_mb: int) -> int:
 
 
 def stats(conn: sqlite3.Connection) -> dict:
-    cur = conn.execute(
-        "SELECT COUNT(*) as count, MAX(created_at) as latest FROM clips"
-    )
+    cur = conn.execute("SELECT COUNT(*) as count, MAX(created_at) as latest FROM clips")
     row = cur.fetchone()
     db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
     return {
@@ -671,8 +679,12 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "cap_by_tag": get_cap_map(conn, "cap_by_tag"),
         "evict_mode": get_evict_mode(conn),
         "ltm_enabled": get_bool_setting(conn, "ltm_enabled", DEFAULT_LTM_ENABLED),
-        "ml_context_level": get_setting(conn, "ml_context_level", DEFAULT_ML_CONTEXT_LEVEL),
-        "ml_processing_mode": get_setting(conn, "ml_processing_mode", DEFAULT_ML_PROCESSING_MODE),
+        "ml_context_level": get_setting(
+            conn, "ml_context_level", DEFAULT_ML_CONTEXT_LEVEL
+        ),
+        "ml_processing_mode": get_setting(
+            conn, "ml_processing_mode", DEFAULT_ML_PROCESSING_MODE
+        ),
         "count": s.get("count", 0),
         "latest": s.get("latest"),
         "db_size_mb": round((s.get("db_size_bytes", 0) or 0) / (1024 * 1024), 3),
@@ -680,7 +692,9 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "sync_target": get_setting(conn, "sync_target", ""),
         "sync_interval": get_sync_interval(conn),
         "license_type": get_license_type(conn, None),
-        "device_count": conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"],
+        "device_count": conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()[
+            "c"
+        ],
     }
 
 
@@ -694,7 +708,9 @@ def resolve_sync_target(target: str) -> Path:
     return dest
 
 
-def write_db_snapshot(dest: Path, source_conn: Optional[sqlite3.Connection] = None) -> None:
+def write_db_snapshot(
+    dest: Path, source_conn: Optional[sqlite3.Connection] = None
+) -> None:
     """Write a consistent SQLite snapshot to dest, including committed WAL pages."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     owned_conn = source_conn is None
@@ -708,7 +724,9 @@ def write_db_snapshot(dest: Path, source_conn: Optional[sqlite3.Connection] = No
             src.close()
 
 
-def sync_push(target: str, source_conn: Optional[sqlite3.Connection] = None) -> tuple[bool, str]:
+def sync_push(
+    target: str, source_conn: Optional[sqlite3.Connection] = None
+) -> tuple[bool, str]:
     dest = resolve_sync_target(target)
     if source_conn is None and not DB_PATH.exists():
         return False, "local DB missing; run init?"
@@ -763,6 +781,7 @@ def get_bool_setting(conn: sqlite3.Connection, key: str, default: bool) -> bool:
 
 
 # --- Gumroad licensing -------------------------------------------------------
+
 
 def gumroad_webhook_secret(conn: sqlite3.Connection) -> str:
     """Shared secret used to HMAC-verify incoming Gumroad webhooks.
@@ -837,10 +856,16 @@ def validate_license(conn: sqlite3.Connection, online: bool = True) -> dict:
     license_key = get_setting(conn, "gumroad_license_key", "").strip()
     if not license_key:
         set_setting(conn, "license_valid", "0")
-        say(FATHER, f"no Gumroad license found — running unlicensed (${GUMROAD_PRICE_USD} lifetime at gumroad.com)")
+        say(
+            FATHER,
+            f"no Gumroad license found — running unlicensed (${GUMROAD_PRICE_USD} lifetime at gumroad.com)",
+        )
         return {"valid": False, "reason": "no_license"}
 
-    permalink = get_setting(conn, "gumroad_permalink", DEFAULT_GUMROAD_PERMALINK).strip() or DEFAULT_GUMROAD_PERMALINK
+    permalink = (
+        get_setting(conn, "gumroad_permalink", DEFAULT_GUMROAD_PERMALINK).strip()
+        or DEFAULT_GUMROAD_PERMALINK
+    )
     if online:
         result = _gumroad_verify_online(permalink, license_key)
         if result is not None:
@@ -851,12 +876,18 @@ def validate_license(conn: sqlite3.Connection, online: bool = True) -> dict:
             if valid:
                 say(FATHER, "Gumroad license verified — thank you for your purchase")
             else:
-                say(FATHER, "Gumroad license could not be verified (invalid or refunded)")
+                say(
+                    FATHER,
+                    "Gumroad license could not be verified (invalid or refunded)",
+                )
             return {"valid": valid, "reason": "verified" if valid else "rejected"}
 
     # Offline (or online check skipped): trust the cached verdict.
     cached = get_bool_setting(conn, "license_valid", False)
-    say(FATHER, f"Gumroad license present (cached status: {'valid' if cached else 'unverified'})")
+    say(
+        FATHER,
+        f"Gumroad license present (cached status: {'valid' if cached else 'unverified'})",
+    )
     return {"valid": cached, "reason": "cached"}
 
 
@@ -1196,7 +1227,9 @@ def set_allow_pdf(conn: sqlite3.Connection, allow: bool) -> None:
 
 
 def get_allow_images(conn: sqlite3.Connection) -> bool:
-    return get_setting(conn, "allow_images", "1" if DEFAULT_ALLOW_IMAGES else "0") == "1"
+    return (
+        get_setting(conn, "allow_images", "1" if DEFAULT_ALLOW_IMAGES else "0") == "1"
+    )
 
 
 def set_allow_images(conn: sqlite3.Connection, allow: bool) -> None:
@@ -1435,17 +1468,24 @@ def embed_from_kind(kind: str, text: str) -> tuple[list[float], str]:
         if vec:
             return vec, "e5-small"
         if not _EMBEDDER_WARNED:
-            say(FATHER, "embedder 'e5-small' unavailable; falling back to hash (pip install sentence-transformers)")
+            say(
+                FATHER,
+                "embedder 'e5-small' unavailable; falling back to hash (pip install sentence-transformers)",
+            )
             _EMBEDDER_WARNED = True
     return hash_embed(text), "hash"
 
 
-def embed_text(conn: sqlite3.Connection, text: str, embedder_override: Optional[str] = None) -> tuple[list[float], str]:
+def embed_text(
+    conn: sqlite3.Connection, text: str, embedder_override: Optional[str] = None
+) -> tuple[list[float], str]:
     kind = get_embedder(conn, embedder_override)
     return embed_from_kind(kind, text)
 
 
-def store_embedding(conn: sqlite3.Connection, clip_id: int, vec: list[float], model: str) -> None:
+def store_embedding(
+    conn: sqlite3.Connection, clip_id: int, vec: list[float], model: str
+) -> None:
     conn.execute(
         "INSERT INTO clip_vectors(clip_id, dim, vector, model) VALUES (?, ?, ?, ?) ON CONFLICT(clip_id) DO UPDATE SET dim=excluded.dim, vector=excluded.vector, model=excluded.model",
         (clip_id, len(vec), json.dumps(vec), model),
@@ -1475,7 +1515,9 @@ def build_ann_index(rows: Iterable[sqlite3.Row]) -> tuple[list[int], list[list[f
     return ids, vecs
 
 
-def knn(query: list[float], ids: list[int], vecs: list[list[float]], limit: int) -> list[tuple[float, int]]:
+def knn(
+    query: list[float], ids: list[int], vecs: list[list[float]], limit: int
+) -> list[tuple[float, int]]:
     sims = []
     for cid, vec in zip(ids, vecs):
         sims.append((cosine(query, vec), cid))
@@ -1555,7 +1597,9 @@ def tags_for_clip(conn: sqlite3.Connection, clip_id: int) -> list[str]:
     return [row["name"] for row in cur.fetchall()]
 
 
-def tags_for_clips(conn: sqlite3.Connection, clip_ids: list[int]) -> dict[int, list[str]]:
+def tags_for_clips(
+    conn: sqlite3.Connection, clip_ids: list[int]
+) -> dict[int, list[str]]:
     if not clip_ids:
         return {}
     placeholders = ",".join("?" for _ in clip_ids)
@@ -1587,7 +1631,9 @@ def add_note(conn: sqlite3.Connection, clip_id: int, note: str) -> bool:
     return True
 
 
-def notes_for_clips(conn: sqlite3.Connection, clip_ids: list[int]) -> dict[int, list[dict]]:
+def notes_for_clips(
+    conn: sqlite3.Connection, clip_ids: list[int]
+) -> dict[int, list[dict]]:
     if not clip_ids:
         return {}
     placeholders = ",".join("?" for _ in clip_ids)
@@ -1602,11 +1648,15 @@ def notes_for_clips(conn: sqlite3.Connection, clip_ids: list[int]) -> dict[int, 
     )
     result: dict[int, list[dict]] = {}
     for row in cur.fetchall():
-        result.setdefault(row["clip_id"], []).append({"note": row["note"], "created_at": row["created_at"]})
+        result.setdefault(row["clip_id"], []).append(
+            {"note": row["note"], "created_at": row["created_at"]}
+        )
     return result
 
 
-def add_copilot_chat(conn: sqlite3.Connection, content: str, title: Optional[str], model: Optional[str]) -> bool:
+def add_copilot_chat(
+    conn: sqlite3.Connection, content: str, title: Optional[str], model: Optional[str]
+) -> bool:
     clean = content.strip()
     if not clean:
         return False
@@ -1706,7 +1756,9 @@ def command_exists(cmd: str) -> bool:
     return subprocess.call(["/bin/sh", "-c", f"command -v {cmd} >/dev/null 2>&1"]) == 0
 
 
-def run_helper(cmd: str, text: str, timeout: float = 5.0, env: Optional[dict] = None) -> Optional[str]:
+def run_helper(
+    cmd: str, text: str, timeout: float = 5.0, env: Optional[dict] = None
+) -> Optional[str]:
     """Run a helper command with text piped to stdin; returns stdout or None on failure."""
     try:
         res = subprocess.run(
@@ -1778,7 +1830,16 @@ def run_ai_helper(
     if not helper_cmd:
         return False, f"configure {setting_key} via config --set", None, None
     since_iso = iso_hours_ago(hours) if hours is not None else None
-    rows, tag_map = filtered_rows(conn, limit, app=None, contains=None, tag=None, pins_only=False, since_iso=since_iso, until_iso=None)
+    rows, tag_map = filtered_rows(
+        conn,
+        limit,
+        app=None,
+        contains=None,
+        tag=None,
+        pins_only=False,
+        since_iso=since_iso,
+        until_iso=None,
+    )
     if not rows:
         return False, "no clips available", None, None
     lines: list[str] = []
@@ -1786,7 +1847,9 @@ def run_ai_helper(
         tags = tag_map.get(row["id"], [])
         tag_str = f" tags={','.join(tags)}" if tags else ""
         title = row["title"] or row["window_title"] or ""
-        lines.append(f"#{row['id']} [{row['source_app'] or 'unknown'}] {row['created_at']}{tag_str} {title}".strip())
+        lines.append(
+            f"#{row['id']} [{row['source_app'] or 'unknown'}] {row['created_at']}{tag_str} {title}".strip()
+        )
         lines.append(row["content"])
         lines.append("")
     payload = "\n".join(lines)
@@ -1859,7 +1922,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
     max_bytes = get_max_bytes(conn, args.max_bytes)
     max_db_mb = get_max_db_mb(conn, None)
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
-    notify_override: Optional[bool] = True if args.notify else False if args.no_notify else None
+    notify_override: Optional[bool] = (
+        True if args.notify else False if args.no_notify else None
+    )
     notify_enabled = get_notify(conn, notify_override)
     gate = enforce_license_gate(
         conn,
@@ -1870,7 +1935,10 @@ def cmd_watch(args: argparse.Namespace) -> None:
     cap = gate["effective_cap"]
     embedder_choice = gate["effective_embedder"]
     if not gate["device_allowed"]:
-        say(MOTHER, "device not licensed; not capturing. Free up a device slot or upgrade.")
+        say(
+            MOTHER,
+            "device not licensed; not capturing. Free up a device slot or upgrade.",
+        )
         return
     say(MOTHER, f"license={gate['license_type']} cap={cap} embedder={embedder_choice}")
     cap_by_app = get_cap_map(conn, "cap_by_app")
@@ -1883,7 +1951,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
     def finish_tick() -> None:
         nonlocal last_sync_at, last_sync_target
-        last_sync_at, last_sync_target = maybe_watch_sync(conn, last_sync_at, last_sync_target)
+        last_sync_at, last_sync_target = maybe_watch_sync(
+            conn, last_sync_at, last_sync_target
+        )
         time.sleep(interval)
 
     say(MOTHER, "watching clipboard... Ctrl+C to stop.")
@@ -1902,7 +1972,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
             clip = read_clipboard()
             if clip:
-                context_level = get_setting(conn, "ml_context_level", DEFAULT_ML_CONTEXT_LEVEL)
+                context_level = get_setting(
+                    conn, "ml_context_level", DEFAULT_ML_CONTEXT_LEVEL
+                )
                 ltm_enabled = get_bool_setting(conn, "ltm_enabled", DEFAULT_LTM_ENABLED)
                 allow_summary, allow_tags = auto_context_flags(context_level)
                 if not ltm_enabled:
@@ -1919,9 +1991,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         continue
                     clip_bytes = clip.encode("utf-8", errors="ignore")
                     if len(clip_bytes) > max_bytes:
-                        say(MOTHER, f"skipped large clip ({len(clip_bytes)} bytes > max {max_bytes})")
+                        say(
+                            MOTHER,
+                            f"skipped large clip ({len(clip_bytes)} bytes > max {max_bytes})",
+                        )
                         if notify_enabled:
-                            toast("Mother skipped large clip", f"{app} ({len(clip_bytes)} bytes)")
+                            toast(
+                                "Mother skipped large clip",
+                                f"{app} ({len(clip_bytes)} bytes)",
+                            )
                         last_digest = digest
                         finish_tick()
                         continue
@@ -1929,9 +2007,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         if args.redact:
                             clip = redact_secrets(clip)
                         else:
-                            say(MOTHER, "skipped clip that looks like a secret (pattern match). Enable allow_secrets or use --redact.")
+                            say(
+                                MOTHER,
+                                "skipped clip that looks like a secret (pattern match). Enable allow_secrets or use --redact.",
+                            )
                             if notify_enabled:
-                                toast("Mother skipped secret-looking clip", app or "unknown")
+                                toast(
+                                    "Mother skipped secret-looking clip",
+                                    app or "unknown",
+                                )
                             last_digest = digest
                             finish_tick()
                             continue
@@ -1942,14 +2026,24 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         say(MOTHER, f"noted repeat clip #{existing_id}")
                     else:
                         # derive a simple title (first line trimmed), optionally summarize
-                        first_line = clip.strip().splitlines()[0] if clip.strip() else ""
+                        first_line = (
+                            clip.strip().splitlines()[0] if clip.strip() else ""
+                        )
                         if auto_summary_cmd and allow_summary:
                             maybe = run_helper(auto_summary_cmd, clip, timeout=6.0)
                             if maybe:
                                 first_line = maybe
                         if len(first_line) > 120:
                             first_line = first_line[:117] + "..."
-                        inserted_id = insert_clip(conn, clip, app=app, window=window, digest=digest, title=first_line, embedder_override=embedder_choice)
+                        inserted_id = insert_clip(
+                            conn,
+                            clip,
+                            app=app,
+                            window=window,
+                            digest=digest,
+                            title=first_line,
+                            embedder_override=embedder_choice,
+                        )
                         if inserted_id:
                             insert_event(conn, inserted_id)
                             say(MOTHER, f"saved clip #{inserted_id}")
@@ -1959,29 +2053,51 @@ def cmd_watch(args: argparse.Namespace) -> None:
                                 tags_out = run_helper(auto_tag_cmd, clip, timeout=6.0)
                                 if tags_out:
                                     # split on comma or whitespace
-                                    parts = [t.strip().lower() for t in re.split(r"[,\s]+", tags_out) if t.strip()]
+                                    parts = [
+                                        t.strip().lower()
+                                        for t in re.split(r"[,\s]+", tags_out)
+                                        if t.strip()
+                                    ]
                                     for t in parts:
                                         assign_tag(conn, inserted_id, t)
                             if app and app.strip().lower() in cap_by_app:
-                                ev = evict_app_cap(conn, app.strip().lower(), cap_by_app[app.strip().lower()])
+                                ev = evict_app_cap(
+                                    conn,
+                                    app.strip().lower(),
+                                    cap_by_app[app.strip().lower()],
+                                )
                                 if ev:
-                                    say(MOTHER, f"evicted {ev} old clips for app cap ({app})")
+                                    say(
+                                        MOTHER,
+                                        f"evicted {ev} old clips for app cap ({app})",
+                                    )
                             if cap:
                                 pruned = prune(conn, cap)
                                 if pruned:
-                                    say(MOTHER, f"pruned {pruned} old clips (cap={cap})")
+                                    say(
+                                        MOTHER, f"pruned {pruned} old clips (cap={cap})"
+                                    )
                             ev = evict_if_needed(conn, max_db_mb)
                             if ev:
-                                say(MOTHER, f"evicted {ev} oldest clips to honor db cap {max_db_mb}MB")
+                                say(
+                                    MOTHER,
+                                    f"evicted {ev} oldest clips to honor db cap {max_db_mb}MB",
+                                )
                             # backpressure warnings
                             if cap:
-                                total = conn.execute("SELECT COUNT(*) AS c FROM clips").fetchone()["c"]
+                                total = conn.execute(
+                                    "SELECT COUNT(*) AS c FROM clips"
+                                ).fetchone()["c"]
                                 if total and total > 0.9 * cap:
                                     msg = f"near cap ({total}/{cap}); consider purge"
                                     say(MOTHER, msg)
                                     if notify_enabled:
                                         toast("Mother nearing cap", msg)
-                            size_mb = DB_PATH.stat().st_size / (1024 * 1024) if DB_PATH.exists() else 0
+                            size_mb = (
+                                DB_PATH.stat().st_size / (1024 * 1024)
+                                if DB_PATH.exists()
+                                else 0
+                            )
                             if size_mb > 0.8 * max_db_mb:
                                 msg = f"DB size {size_mb:.1f}MB near cap {max_db_mb}MB"
                                 say(MOTHER, msg)
@@ -2086,7 +2202,10 @@ def cmd_recent(args: argparse.Namespace) -> None:
         title = f" \"{row['title']}\"" if row["title"] else ""
         lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
         lang_str = f" lang={lang}" if lang else ""
-        say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
+        say(
+            FATHER,
+            f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}",
+        )
 
 
 def cmd_search(args: argparse.Namespace) -> None:
@@ -2137,7 +2256,10 @@ def cmd_search(args: argparse.Namespace) -> None:
         title = f" \"{row['title']}\"" if row["title"] else ""
         lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
         lang_str = f" lang={lang}" if lang else ""
-        say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
+        say(
+            FATHER,
+            f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}",
+        )
 
 
 def topic_groups(
@@ -2177,7 +2299,9 @@ def topic_groups(
             slot["items"].append(row)
             if row["created_at"] > slot["latest"]:
                 slot["latest"] = row["created_at"]
-    ordered = sorted(groups.values(), key=lambda g: g["latest"], reverse=True)[:limit_groups]
+    ordered = sorted(groups.values(), key=lambda g: g["latest"], reverse=True)[
+        :limit_groups
+    ]
     output: list[dict] = []
     for grp in ordered:
         grp["items"].sort(key=lambda r: r["created_at"], reverse=True)
@@ -2253,7 +2377,9 @@ def fetch_semantic_candidates(
 def cmd_semantic_search(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    qvec, model_used = embed_from_kind(get_embedder(conn, getattr(args, "embedder", None)), args.query)
+    qvec, model_used = embed_from_kind(
+        get_embedder(conn, getattr(args, "embedder", None)), args.query
+    )
     since_iso = parse_iso_dt(args.since) if getattr(args, "since", None) else None
     if getattr(args, "since_hours", None) is not None:
         since_iso = iso_hours_ago(args.since_hours)
@@ -2285,7 +2411,10 @@ def cmd_semantic_search(args: argparse.Namespace) -> None:
         title = f" \"{row['title']}\"" if row["title"] else ""
         lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
         lang_str = f" lang={lang}" if lang else ""
-        say(FATHER, f"{pin_mark}#{row['id']:>5} sim={sim:.3f} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
+        say(
+            FATHER,
+            f"{pin_mark}#{row['id']:>5} sim={sim:.3f} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}",
+        )
 
 
 def cmd_delete(args: argparse.Namespace) -> None:
@@ -2365,7 +2494,10 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, "Account")
     say(FATHER, f"  email={format_setting_value(account.get('email'))}")
     say(FATHER, f"  avatar={format_setting_value(account.get('avatar'))}")
-    say(FATHER, f"  linked_accounts={format_setting_value(account.get('linked_accounts'))}")
+    say(
+        FATHER,
+        f"  linked_accounts={format_setting_value(account.get('linked_accounts'))}",
+    )
     say(FATHER, f"  organizations={format_setting_value(account.get('organizations'))}")
     say(FATHER, f"  upgrade_url={format_setting_value(account.get('upgrade_url'))}")
 
@@ -2383,16 +2515,24 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, "Copilot Chats")
     say(FATHER, f"  model={format_setting_value(copilot.get('model'))}")
     say(FATHER, f"  accent={format_setting_value(copilot.get('accent'))}")
-    say(FATHER, f"  use_ltm_by_default={format_setting_value(copilot.get('use_ltm_by_default'))}")
+    say(
+        FATHER,
+        f"  use_ltm_by_default={format_setting_value(copilot.get('use_ltm_by_default'))}",
+    )
     say(FATHER, f"  chat_count={format_setting_value(copilot.get('chat_count'))}")
 
     ml = snap["machine_learning"]
     say(FATHER, "Machine Learning")
-    say(FATHER, f"  auto_context_level={format_setting_value(ml.get('auto_context_level'))}")
+    say(
+        FATHER,
+        f"  auto_context_level={format_setting_value(ml.get('auto_context_level'))}",
+    )
     say(FATHER, f"  processing_mode={format_setting_value(ml.get('processing_mode'))}")
     say(FATHER, f"  ltm_enabled={format_setting_value(ml.get('ltm_enabled'))}")
     say(FATHER, f"  ltm_permissions={format_setting_value(ml.get('ltm_permissions'))}")
-    say(FATHER, f"  source_blocklist={format_setting_value(ml.get('source_blocklist'))}")
+    say(
+        FATHER, f"  source_blocklist={format_setting_value(ml.get('source_blocklist'))}"
+    )
 
     mcp = snap["mcp"]
     say(FATHER, "Model Context Protocol (MCP)")
@@ -2408,8 +2548,14 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, "Views & Layouts")
     say(FATHER, f"  default_view={format_setting_value(views.get('default_view'))}")
     say(FATHER, f"  confirmations={format_setting_value(views.get('confirmations'))}")
-    say(FATHER, f"  metrics_summary={format_setting_value(views.get('metrics_summary'))}")
-    say(FATHER, f"  default_toolbar={format_setting_value(views.get('default_toolbar'))}")
+    say(
+        FATHER,
+        f"  metrics_summary={format_setting_value(views.get('metrics_summary'))}",
+    )
+    say(
+        FATHER,
+        f"  default_toolbar={format_setting_value(views.get('default_toolbar'))}",
+    )
 
     aest = snap["aesthetics"]
     say(FATHER, "Aesthetics")
@@ -2504,7 +2650,10 @@ def cmd_copilot(args: argparse.Namespace) -> None:
         accent = get_setting_typed(conn, "copilot_accent")
         use_ltm = get_setting_typed(conn, "copilot_use_ltm")
         count = copilot_chat_count(conn)
-        say(FATHER, f"model={model}, accent={accent}, use_ltm_by_default={use_ltm}, chats={count}")
+        say(
+            FATHER,
+            f"model={model}, accent={accent}, use_ltm_by_default={use_ltm}, chats={count}",
+        )
 
 
 def cmd_ml(args: argparse.Namespace) -> None:
@@ -2531,18 +2680,28 @@ def cmd_ml(args: argparse.Namespace) -> None:
         current = get_embedder(conn, None)
         if current != "hash":
             set_embedder(conn, "hash")
-            say(FATHER, "set embedder=hash to reduce memory; restart watcher to unload heavy models")
+            say(
+                FATHER,
+                "set embedder=hash to reduce memory; restart watcher to unload heavy models",
+            )
         else:
             say(FATHER, "embedder already hash; nothing to optimize")
         did_action = True
-    if args.clear_all or args.clear_older_than_days or args.clear_since or args.clear_until:
+    if (
+        args.clear_all
+        or args.clear_older_than_days
+        or args.clear_since
+        or args.clear_until
+    ):
         if not args.yes:
             say(FATHER, "refusing to clear data without --yes")
             return
         clauses = []
         params = []
         if args.clear_older_than_days is not None:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=args.clear_older_than_days)
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                days=args.clear_older_than_days
+            )
             clauses.append("datetime(created_at) < datetime(?)")
             params.append(cutoff.isoformat())
         if args.clear_since:
@@ -2655,12 +2814,18 @@ def cmd_show(args: argparse.Namespace) -> None:
     lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
     lang_str = f" lang={lang}" if lang else ""
     # events count
-    cur_e = conn.execute("SELECT COUNT(*) AS n, MIN(seen_at) AS first, MAX(seen_at) AS last FROM clip_events WHERE clip_id = ?", (row["id"],))
+    cur_e = conn.execute(
+        "SELECT COUNT(*) AS n, MIN(seen_at) AS first, MAX(seen_at) AS last FROM clip_events WHERE clip_id = ?",
+        (row["id"],),
+    )
     ev = cur_e.fetchone()
     ev_summary = ""
     if ev and ev["n"]:
         ev_summary = f" seen={ev['n']} first={ev['first']} last={ev['last']}"
-    say(FATHER, f"{pin_mark}#{row['id']} {row['created_at']} [{row['source_app']}] {row['window_title']}{title}{tags_str}{file_str}{lang_str}")
+    say(
+        FATHER,
+        f"{pin_mark}#{row['id']} {row['created_at']} [{row['source_app']}] {row['window_title']}{title}{tags_str}{file_str}{lang_str}",
+    )
     if ev_summary:
         say(FATHER, ev_summary)
     print(row["content"])
@@ -2669,8 +2834,19 @@ def cmd_show(args: argparse.Namespace) -> None:
 def cmd_export(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
-    items = export_items(conn, args.limit, app=args.app, tag=args.tag, since_iso=since_iso, pins_only=args.pins_only)
+    since_iso = (
+        iso_hours_ago(args.since_hours)
+        if getattr(args, "since_hours", None) is not None
+        else None
+    )
+    items = export_items(
+        conn,
+        args.limit,
+        app=args.app,
+        tag=args.tag,
+        since_iso=since_iso,
+        pins_only=args.pins_only,
+    )
     data = json.dumps(items, indent=2, ensure_ascii=False)
     if args.path:
         Path(args.path).write_text(data, encoding="utf-8")
@@ -2720,7 +2896,11 @@ def build_markdown_outline(
                 tag_str = f" (tags: {', '.join(tags)})" if tags else ""
                 title = row["title"] or row["window_title"] or ""
                 if not title:
-                    title = (row["content"] or "").strip().splitlines()[0] if (row["content"] or "").strip() else ""
+                    title = (
+                        (row["content"] or "").strip().splitlines()[0]
+                        if (row["content"] or "").strip()
+                        else ""
+                    )
                 if len(title) > 120:
                     title = title[:117] + "..."
                 pin = " 🔖" if row["pinned"] else ""
@@ -2755,8 +2935,19 @@ def cmd_export_md(args: argparse.Namespace) -> None:
 def cmd_federate_export(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
-    items = export_items(conn, args.limit, app=args.app, tag=args.tag, since_iso=since_iso, pins_only=args.pins_only)
+    since_iso = (
+        iso_hours_ago(args.since_hours)
+        if getattr(args, "since_hours", None) is not None
+        else None
+    )
+    items = export_items(
+        conn,
+        args.limit,
+        app=args.app,
+        tag=args.tag,
+        since_iso=since_iso,
+        pins_only=args.pins_only,
+    )
     payload = {"items": items}
     data = json.dumps(payload, indent=2, ensure_ascii=False)
     if args.path:
@@ -2769,11 +2960,24 @@ def cmd_federate_export(args: argparse.Namespace) -> None:
 def cmd_federate_push(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
-    items = export_items(conn, args.limit, app=args.app, tag=args.tag, since_iso=since_iso, pins_only=args.pins_only)
+    since_iso = (
+        iso_hours_ago(args.since_hours)
+        if getattr(args, "since_hours", None) is not None
+        else None
+    )
+    items = export_items(
+        conn,
+        args.limit,
+        app=args.app,
+        tag=args.tag,
+        since_iso=since_iso,
+        pins_only=args.pins_only,
+    )
     payload = json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
     try:
-        req = urllib.request.Request(args.url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            args.url, data=payload, headers={"Content-Type": "application/json"}
+        )
         with urllib.request.urlopen(req, timeout=10.0) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
         say(FATHER, f"pushed {len(items)} items to {args.url}; response={body[:200]}")
@@ -2819,7 +3023,13 @@ def cmd_config(args: argparse.Namespace) -> None:
             say(FATHER, f"sync_target={get_setting(conn, 'sync_target', '')}")
         elif key == "sync_interval":
             say(FATHER, f"sync_interval={get_sync_interval(conn)}")
-        elif key in ("backup_bucket", "backup_endpoint", "backup_region", "backup_prefix", "backup_access_key"):
+        elif key in (
+            "backup_bucket",
+            "backup_endpoint",
+            "backup_region",
+            "backup_prefix",
+            "backup_access_key",
+        ):
             say(FATHER, f"{key}={get_setting(conn, key, '')}")
         elif key in ("backup_passphrase", "backup_secret_key"):
             secret = get_setting(conn, key, "")
@@ -2834,17 +3044,35 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key == "ai_fill_cmd":
             say(FATHER, f"ai_fill_cmd={get_setting(conn, 'ai_fill_cmd', '')}")
         elif key == "helper_rewrite_cmd":
-            say(FATHER, f"helper_rewrite_cmd={get_setting(conn, 'helper_rewrite_cmd', '')}")
+            say(
+                FATHER,
+                f"helper_rewrite_cmd={get_setting(conn, 'helper_rewrite_cmd', '')}",
+            )
         elif key == "helper_shorten_cmd":
-            say(FATHER, f"helper_shorten_cmd={get_setting(conn, 'helper_shorten_cmd', '')}")
+            say(
+                FATHER,
+                f"helper_shorten_cmd={get_setting(conn, 'helper_shorten_cmd', '')}",
+            )
         elif key == "helper_extract_cmd":
-            say(FATHER, f"helper_extract_cmd={get_setting(conn, 'helper_extract_cmd', '')}")
+            say(
+                FATHER,
+                f"helper_extract_cmd={get_setting(conn, 'helper_extract_cmd', '')}",
+            )
         elif key == "ml_context_level":
-            say(FATHER, f"ml_context_level={get_setting(conn, 'ml_context_level', DEFAULT_ML_CONTEXT_LEVEL)}")
+            say(
+                FATHER,
+                f"ml_context_level={get_setting(conn, 'ml_context_level', DEFAULT_ML_CONTEXT_LEVEL)}",
+            )
         elif key == "ml_processing_mode":
-            say(FATHER, f"ml_processing_mode={get_setting(conn, 'ml_processing_mode', DEFAULT_ML_PROCESSING_MODE)}")
+            say(
+                FATHER,
+                f"ml_processing_mode={get_setting(conn, 'ml_processing_mode', DEFAULT_ML_PROCESSING_MODE)}",
+            )
         elif key == "ltm_enabled":
-            say(FATHER, f"ltm_enabled={get_bool_setting(conn, 'ltm_enabled', DEFAULT_LTM_ENABLED)}")
+            say(
+                FATHER,
+                f"ltm_enabled={get_bool_setting(conn, 'ltm_enabled', DEFAULT_LTM_ENABLED)}",
+            )
         elif key == "license_type":
             lt = get_license_type(conn, None)
             limits = LICENSE_TIERS[lt]
@@ -2855,7 +3083,10 @@ def cmd_config(args: argparse.Namespace) -> None:
                 f"federation={limits['federation']})",
             )
         elif key == "federation_enabled":
-            say(FATHER, f"federation_enabled={get_bool_setting(conn, 'federation_enabled', False)}")
+            say(
+                FATHER,
+                f"federation_enabled={get_bool_setting(conn, 'federation_enabled', False)}",
+            )
         else:
             say(FATHER, f"unknown key '{key}'")
         return
@@ -2947,7 +3178,13 @@ def cmd_config(args: argparse.Namespace) -> None:
                 say(FATHER, f"set sync_interval={floatval}")
             except ValueError:
                 say(FATHER, "value must be a number of seconds")
-        elif key in ("backup_bucket", "backup_endpoint", "backup_region", "backup_prefix", "backup_access_key"):
+        elif key in (
+            "backup_bucket",
+            "backup_endpoint",
+            "backup_region",
+            "backup_prefix",
+            "backup_access_key",
+        ):
             set_setting(conn, key, value)
             say(FATHER, f"set {key}={value}")
         elif key in ("backup_passphrase", "backup_secret_key"):
@@ -3000,7 +3237,10 @@ def cmd_config(args: argparse.Namespace) -> None:
                 lt = set_license_type(conn, value)
                 say(FATHER, f"set license_type={lt}")
             else:
-                say(FATHER, f"license_type must be one of: {', '.join(sorted(LICENSE_TIERS))}")
+                say(
+                    FATHER,
+                    f"license_type must be one of: {', '.join(sorted(LICENSE_TIERS))}",
+                )
         elif key == "federation_enabled":
             if value.lower() in ("1", "true", "yes", "on"):
                 set_bool_setting(conn, "federation_enabled", True)
@@ -3018,7 +3258,9 @@ def cmd_install_launchagent(args: argparse.Namespace) -> None:
     """
     Install or remove a LaunchAgent to run the watcher on login.
     """
-    plist_path = Path.home() / "Library" / "LaunchAgents" / "com.my-father-mother.watch.plist"
+    plist_path = (
+        Path.home() / "Library" / "LaunchAgents" / "com.my-father-mother.watch.plist"
+    )
     if args.remove:
         if plist_path.exists():
             plist_path.unlink()
@@ -3058,7 +3300,10 @@ def cmd_install_launchagent(args: argparse.Namespace) -> None:
 """
     plist_path.parent.mkdir(parents=True, exist_ok=True)
     plist_path.write_text(contents, encoding="utf-8")
-    say(FATHER, f"wrote launch agent to {plist_path}; load with: launchctl load {plist_path}")
+    say(
+        FATHER,
+        f"wrote launch agent to {plist_path}; load with: launchctl load {plist_path}",
+    )
 
 
 def helper_cli(kind: str, args: argparse.Namespace) -> None:
@@ -3071,7 +3316,9 @@ def helper_cli(kind: str, args: argparse.Namespace) -> None:
             say(FATHER, "no clips found")
             return
         target_id = latest["id"]
-    ok, msg, new_id, out = run_user_helper_on_clip(conn, kind, target_id, timeout=args.timeout)
+    ok, msg, new_id, out = run_user_helper_on_clip(
+        conn, kind, target_id, timeout=args.timeout
+    )
     say(FATHER if ok else MOTHER, msg)
     if ok and args.show and out:
         print(out)
@@ -3174,6 +3421,7 @@ def cmd_restore(args: argparse.Namespace) -> None:
         return
     try:
         import shutil
+
         if DB_PATH.exists():
             backup = DB_PATH.with_suffix(".bak")
             shutil.copy2(DB_PATH, backup)
@@ -3212,7 +3460,7 @@ def parse_s3_bucket(spec: str) -> Tuple[str, str]:
     """
     spec = (spec or "").strip()
     if spec.startswith("s3://"):
-        spec = spec[len("s3://"):]
+        spec = spec[len("s3://") :]
     spec = spec.strip("/")
     if not spec:
         return "", ""
@@ -3247,8 +3495,17 @@ def encrypt_file(src: Path, dst: Path, passphrase: str) -> Tuple[bool, str]:
     try:
         proc = subprocess.run(
             [
-                "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt",
-                "-in", str(src), "-out", str(dst), "-pass", "stdin",
+                "openssl",
+                "enc",
+                "-aes-256-cbc",
+                "-pbkdf2",
+                "-salt",
+                "-in",
+                str(src),
+                "-out",
+                str(dst),
+                "-pass",
+                "stdin",
             ],
             input=passphrase.encode("utf-8"),
             capture_output=True,
@@ -3309,7 +3566,11 @@ def perform_cloud_backup(conn: sqlite3.Connection) -> Tuple[bool, str]:
     bucket, spec_prefix = parse_s3_bucket(bucket_spec)
     if not bucket:
         return False, f"could not parse bucket from backup_bucket={bucket_spec!r}"
-    prefix = get_setting(conn, "backup_prefix", "").strip() or spec_prefix or DEFAULT_BACKUP_PREFIX
+    prefix = (
+        get_setting(conn, "backup_prefix", "").strip()
+        or spec_prefix
+        or DEFAULT_BACKUP_PREFIX
+    )
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     name = f"mfm-{ts}.db.enc"
     key = f"{prefix.strip('/')}/{name}" if prefix else name
@@ -3343,7 +3604,13 @@ def perform_cloud_backup(conn: sqlite3.Connection) -> Tuple[bool, str]:
 def cmd_cloud_backup(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    interval = max(60, int(getattr(args, "interval", DEFAULT_BACKUP_INTERVAL) or DEFAULT_BACKUP_INTERVAL))
+    interval = max(
+        60,
+        int(
+            getattr(args, "interval", DEFAULT_BACKUP_INTERVAL)
+            or DEFAULT_BACKUP_INTERVAL
+        ),
+    )
     if getattr(args, "loop", False):
         say(FATHER, f"cloud-backup loop started (every {interval}s); ctrl-c to stop")
         try:
@@ -3499,7 +3766,9 @@ def ingest_file_at_path(
     if suffix == ".pdf":
         if command_exists("pdftotext"):
             try:
-                text = subprocess.check_output(["pdftotext", "-q", "-layout", str(path), "-"]).decode("utf-8", errors="ignore")
+                text = subprocess.check_output(
+                    ["pdftotext", "-q", "-layout", str(path), "-"]
+                ).decode("utf-8", errors="ignore")
             except Exception:
                 text = None
         if not text:
@@ -3511,7 +3780,10 @@ def ingest_file_at_path(
     digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
     existing_id = get_clip_id_by_hash(conn, digest)
     if not allow_secrets and looks_like_secret(text):
-        say(MOTHER, f"skipped {path} (looks like secret). Enable allow_secrets to store.")
+        say(
+            MOTHER,
+            f"skipped {path} (looks like secret). Enable allow_secrets to store.",
+        )
         return None
     title = path.name
     if existing_id:
@@ -3540,7 +3812,13 @@ def ingest_file_at_path(
     return inserted_id
 
 
-def ingest_image_with_ocr(conn: sqlite3.Connection, path: Path, max_bytes: int, allow_secrets: bool, embedder_override: Optional[str] = None) -> Optional[int]:
+def ingest_image_with_ocr(
+    conn: sqlite3.Connection,
+    path: Path,
+    max_bytes: int,
+    allow_secrets: bool,
+    embedder_override: Optional[str] = None,
+) -> Optional[int]:
     if not path.is_file():
         return None
     if not get_allow_images(conn):
@@ -3555,13 +3833,18 @@ def ingest_image_with_ocr(conn: sqlite3.Connection, path: Path, max_bytes: int, 
         say(MOTHER, f"skipped {path} ({size} bytes > max {max_bytes})")
         return None
     try:
-        text = subprocess.check_output(["tesseract", str(path), "stdout"], stderr=subprocess.DEVNULL).decode("utf-8", errors="ignore")
+        text = subprocess.check_output(
+            ["tesseract", str(path), "stdout"], stderr=subprocess.DEVNULL
+        ).decode("utf-8", errors="ignore")
     except Exception:
         return None
     if not text or not text.strip():
         return None
     if not allow_secrets and looks_like_secret(text):
-        say(MOTHER, f"skipped {path} (looks like secret). Enable allow_secrets or use --allow-secrets.")
+        say(
+            MOTHER,
+            f"skipped {path} (looks like secret). Enable allow_secrets or use --allow-secrets.",
+        )
         return None
     digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
     existing_id = get_clip_id_by_hash(conn, digest)
@@ -3607,7 +3890,10 @@ def ingest_transcript(
     if text is None or not text.strip():
         return None
     if not allow_secrets and looks_like_secret(text):
-        say(MOTHER, f"skipped {path} (looks like secret). Enable allow_secrets to store.")
+        say(
+            MOTHER,
+            f"skipped {path} (looks like secret). Enable allow_secrets to store.",
+        )
         return None
     digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
     existing_id = get_clip_id_by_hash(conn, digest)
@@ -3647,11 +3933,19 @@ def import_clips(conn: sqlite3.Connection, items: list[dict]) -> dict:
         file_path = item.get("file_path")
         lang = item.get("lang")
         tags = item.get("tags") or []
-        clip_id = insert_clip_import(conn, content, app, window, created_at, pinned, title, file_path, lang, tags)
+        clip_id = insert_clip_import(
+            conn, content, app, window, created_at, pinned, title, file_path, lang, tags
+        )
         if clip_id is None:
             failed += 1
             continue
-        if content and get_clip_id_by_hash(conn, hashlib.sha256(content.encode('utf-8')).hexdigest()) == clip_id:
+        if (
+            content
+            and get_clip_id_by_hash(
+                conn, hashlib.sha256(content.encode("utf-8")).hexdigest()
+            )
+            == clip_id
+        ):
             inserted += 1
         else:
             existing += 1
@@ -3670,7 +3964,9 @@ def cmd_ingest_file(args: argparse.Namespace) -> None:
     if not path.exists():
         say(MOTHER, f"path not found: {path}")
         return
-    ingest_file_at_path(conn, path, max_bytes, allow_secrets, embedder_choice, tags=args.tag or [])
+    ingest_file_at_path(
+        conn, path, max_bytes, allow_secrets, embedder_choice, tags=args.tag or []
+    )
 
 
 def cmd_watch_inbox(args: argparse.Namespace) -> None:
@@ -3685,11 +3981,21 @@ def cmd_watch_inbox(args: argparse.Namespace) -> None:
         set_allow_pdf(conn, args.allow_pdf)
     embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
     interval = max(1.0, args.interval)
-    say(MOTHER, f"watching inbox {inbox_dir} (extensions: {', '.join(sorted(ALLOWED_EXTS))})")
+    say(
+        MOTHER,
+        f"watching inbox {inbox_dir} (extensions: {', '.join(sorted(ALLOWED_EXTS))})",
+    )
     try:
         while True:
             for path in inbox_dir.iterdir():
-                ingest_file_at_path(conn, path, max_bytes, allow_secrets, embedder_choice, tags=args.tag or [])
+                ingest_file_at_path(
+                    conn,
+                    path,
+                    max_bytes,
+                    allow_secrets,
+                    embedder_choice,
+                    tags=args.tag or [],
+                )
             ev = evict_if_needed(conn, max_db_mb)
             if ev:
                 say(MOTHER, f"evicted {ev} oldest clips to honor db cap {max_db_mb}MB")
@@ -3725,7 +4031,9 @@ def cmd_ingest_transcript(args: argparse.Namespace) -> None:
     if not path.exists():
         say(MOTHER, f"path not found: {path}")
         return
-    res = ingest_transcript(conn, path, max_bytes, allow_secrets, embedder_choice, tags=args.tag or [])
+    res = ingest_transcript(
+        conn, path, max_bytes, allow_secrets, embedder_choice, tags=args.tag or []
+    )
     if not res:
         say(MOTHER, "transcript ingest skipped/failed")
 
@@ -3761,7 +4069,10 @@ def cmd_federate_import(args: argparse.Namespace) -> None:
         say(MOTHER, "expected list of items")
         return
     res = import_clips(conn, items)
-    say(FATHER, f"federate import: inserted={res['inserted']} existing={res['existing']} failed={res['failed']}")
+    say(
+        FATHER,
+        f"federate import: inserted={res['inserted']} existing={res['existing']} failed={res['failed']}",
+    )
 
 
 def cmd_related(args: argparse.Namespace) -> None:
@@ -3796,7 +4107,10 @@ def cmd_related(args: argparse.Namespace) -> None:
         title = f" \"{r['title']}\"" if r["title"] else ""
         lang = r["lang"] if r["lang"] not in (None, "", "unk") else ""
         lang_str = f" lang={lang}" if lang else ""
-        say(FATHER, f"{pin_mark}#{r['id']:>5} sim={sim:.3f} [{r['source_app']}] {preview}{title}{tags_str}{lang_str}")
+        say(
+            FATHER,
+            f"{pin_mark}#{r['id']:>5} sim={sim:.3f} [{r['source_app']}] {preview}{title}{tags_str}{lang_str}",
+        )
 
 
 def cmd_recap(args: argparse.Namespace) -> None:
@@ -3858,7 +4172,10 @@ def cmd_context(args: argparse.Namespace) -> None:
         preview = row["content"].replace("\n", "\\n")
         if len(preview) > 120:
             preview = preview[:117] + "..."
-        say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{notes_str}{lang_str}")
+        say(
+            FATHER,
+            f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{notes_str}{lang_str}",
+        )
 
 
 def cmd_topics(args: argparse.Namespace) -> None:
@@ -3882,7 +4199,10 @@ def cmd_topics(args: argparse.Namespace) -> None:
         say(FATHER, "no clips to group")
         return
     for grp in groups:
-        say(FATHER, f"[{grp['kind']}] {grp['name']} ({grp['count']} clips, latest {grp['latest']})")
+        say(
+            FATHER,
+            f"[{grp['kind']}] {grp['name']} ({grp['count']} clips, latest {grp['latest']})",
+        )
         for row in grp["items"]:
             preview = row["content"].replace("\n", "\\n")
             if len(preview) > 100:
@@ -3893,18 +4213,33 @@ def cmd_topics(args: argparse.Namespace) -> None:
             title = f" \"{row['title']}\"" if row["title"] else ""
             lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
             lang_str = f" lang={lang}" if lang else ""
-            say(FATHER, f"  {pin_mark}#{row['id']:>5} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
+            say(
+                FATHER,
+                f"  {pin_mark}#{row['id']:>5} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}",
+            )
 
 
 def cmd_palette(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
     rows: list[sqlite3.Row] = []
-    since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
+    since_iso = (
+        iso_hours_ago(args.since_hours)
+        if getattr(args, "since_hours", None) is not None
+        else None
+    )
     if args.semantic and args.query:
         embedder_kind = get_embedder(conn, getattr(args, "embedder", None))
         qvec, model_used = embed_from_kind(embedder_kind, args.query)
-        rows_sem = fetch_semantic_candidates(conn, args.app, args.tag, args.limit * 5, model_used, since_iso=since_iso, pins_only=args.pins_only)
+        rows_sem = fetch_semantic_candidates(
+            conn,
+            args.app,
+            args.tag,
+            args.limit * 5,
+            model_used,
+            since_iso=since_iso,
+            pins_only=args.pins_only,
+        )
         ids, vecs = build_ann_index(rows_sem)
         sims = knn(qvec, ids, vecs, args.limit)
         row_map = {row["id"]: row for row in rows_sem}
@@ -3983,7 +4318,10 @@ def cmd_palette(args: argparse.Namespace) -> None:
         pin_mark = "*" if row["pinned"] else " "
         lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
         lang_str = f" lang={lang}" if lang else ""
-        say(FATHER, f"{idx:>2}. {pin_mark}#{row['id']:>5} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
+        say(
+            FATHER,
+            f"{idx:>2}. {pin_mark}#{row['id']:>5} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}",
+        )
     choice = input("[father] pick number to copy (blank to cancel): ").strip()
     if not choice:
         return
@@ -4401,7 +4739,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             app = qs.get("app", [None])[0]
             contains = qs.get("contains", [None])[0]
             tag = qs.get("tag", [None])[0]
-            pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            pins_only = qs.get("pins_only", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             since_param = qs.get("since", [None])[0]
             until_param = qs.get("until", [None])[0]
             hours_param = qs.get("hours", [None])[0]
@@ -4438,20 +4781,27 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                         tags=tag_map.get(row["id"], []),
                         notes=notes_map.get(row["id"], []),
                     )
-            )
+                )
             self._send(200, {"items": rows})
             return
         if path == "/context":
             limit = int(qs.get("limit", [20])[0])
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
-            pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            pins_only = qs.get("pins_only", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             hours_param = qs.get("hours", [None])[0]
             try:
                 hours = float(hours_param) if hours_param is not None else None
             except Exception:
                 hours = None
-            rows = context_bundle(conn, app=app, tag=tag, limit=limit, hours=hours, pins_only=pins_only)
+            rows = context_bundle(
+                conn, app=app, tag=tag, limit=limit, hours=hours, pins_only=pins_only
+            )
             self._send(200, {"items": rows})
             return
         if path == "/topics":
@@ -4459,7 +4809,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             per_group = int(qs.get("per_group", [5])[0])
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
-            pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            pins_only = qs.get("pins_only", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             since_param = qs.get("since", [None])[0]
             until_param = qs.get("until", [None])[0]
             hours_param = qs.get("hours", [None])[0]
@@ -4487,7 +4842,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             limit = int(qs.get("limit", [10])[0])
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
-            pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            pins_only = qs.get("pins_only", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             since_param = qs.get("since", [None])[0]
             until_param = qs.get("until", [None])[0]
             hours_param = qs.get("hours", [None])[0]
@@ -4589,14 +4949,21 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             limit = int(qs.get("limit", [200])[0])
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
-            pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            pins_only = qs.get("pins_only", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             hours_param = qs.get("hours", [None])[0]
             try:
                 hours = float(hours_param) if hours_param is not None else None
             except Exception:
                 hours = None
             since_iso = iso_hours_ago(hours) if hours is not None else None
-            items = export_items(conn, limit, app=app, tag=tag, since_iso=since_iso, pins_only=pins_only)
+            items = export_items(
+                conn, limit, app=app, tag=tag, since_iso=since_iso, pins_only=pins_only
+            )
             self._send(200, {"items": items})
             return
         if path == "/clip":
@@ -4652,7 +5019,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         if path == "/export_md":
             hours_param = qs.get("hours", [None])[0]
             limit = int(qs.get("limit", [200])[0])
-            since_iso = iso_hours_ago(float(hours_param)) if hours_param is not None else None
+            since_iso = (
+                iso_hours_ago(float(hours_param)) if hours_param is not None else None
+            )
             md, count = build_markdown_outline(conn, since_iso, limit=limit)
             body = md.encode("utf-8")
             self.send_response(200)
@@ -4670,7 +5039,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             pool = int(qs.get("pool", [2000])[0])
             embedder_kind = get_embedder(conn, qs.get("embedder", [None])[0])
             qvec, model_used = embed_from_kind(embedder_kind, q)
-            pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            pins_only = qs.get("pins_only", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             since_param = qs.get("since", [None])[0]
             until_param = qs.get("until", [None])[0]
             hours_param = qs.get("hours", [None])[0]
@@ -4681,7 +5055,16 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
             until_iso = parse_iso_dt(until_param) if until_param else None
-            rows = fetch_semantic_candidates(conn, app, tag, pool, model_used, since_iso=since_iso, until_iso=until_iso, pins_only=pins_only)
+            rows = fetch_semantic_candidates(
+                conn,
+                app,
+                tag,
+                pool,
+                model_used,
+                since_iso=since_iso,
+                until_iso=until_iso,
+                pins_only=pins_only,
+            )
             ids, vecs = build_ann_index(rows)
             sims = knn(qvec, ids, vecs, limit)
             row_map = {row["id"]: row for row in rows}
@@ -4735,7 +5118,14 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 status = validate_license(conn)
             except Exception:
                 status = {"valid": get_bool_setting(conn, "license_valid", False)}
-            self._send(200, {"ok": True, "stored": True, "license_valid": bool(status.get("valid"))})
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "stored": True,
+                    "license_valid": bool(status.get("valid")),
+                },
+            )
             return
         if path == "/pin":
             data = self._parse_json()
@@ -4746,14 +5136,18 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 return
             state = data.get("pinned")
             if state is None:
-                cur = conn.execute("UPDATE clips SET pinned = 1 - pinned WHERE id = ?", (cid,))
+                cur = conn.execute(
+                    "UPDATE clips SET pinned = 1 - pinned WHERE id = ?", (cid,)
+                )
             else:
-                cur = conn.execute("UPDATE clips SET pinned = ? WHERE id = ?", (1 if state else 0, cid))
+                cur = conn.execute(
+                    "UPDATE clips SET pinned = ? WHERE id = ?", (1 if state else 0, cid)
+                )
             conn.commit()
             if cur.rowcount:
                 cur2 = conn.execute("SELECT pinned FROM clips WHERE id = ?", (cid,))
                 row = cur2.fetchone()
-                self._send(200, {"ok": True, "pinned": bool(row['pinned'])})
+                self._send(200, {"ok": True, "pinned": bool(row["pinned"])})
             else:
                 self._send(404, {"error": "not found"})
             return
@@ -4821,7 +5215,11 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             if "evict_mode" in data:
                 set_evict_mode(conn, str(data["evict_mode"]))
                 updated["evict_mode"] = get_evict_mode(conn)
-            for helper_key in ("helper_rewrite_cmd", "helper_shorten_cmd", "helper_extract_cmd"):
+            for helper_key in (
+                "helper_rewrite_cmd",
+                "helper_shorten_cmd",
+                "helper_extract_cmd",
+            ):
                 if helper_key in data:
                     set_setting(conn, helper_key, str(data[helper_key]))
                     updated[helper_key] = get_setting(conn, helper_key, "")
@@ -4842,11 +5240,19 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             if "ai_fill_cmd" in data:
                 set_setting(conn, "ai_fill_cmd", str(data["ai_fill_cmd"]))
                 updated["ai_fill_cmd"] = get_setting(conn, "ai_fill_cmd", "")
-            for gr_key in ("gumroad_webhook_secret", "gumroad_permalink", "gumroad_license_key"):
+            for gr_key in (
+                "gumroad_webhook_secret",
+                "gumroad_permalink",
+                "gumroad_license_key",
+            ):
                 if gr_key in data:
                     set_setting(conn, gr_key, str(data[gr_key]))
                     # Never echo the secret back in the response.
-                    updated[gr_key] = "***" if gr_key == "gumroad_webhook_secret" else get_setting(conn, gr_key, "")
+                    updated[gr_key] = (
+                        "***"
+                        if gr_key == "gumroad_webhook_secret"
+                        else get_setting(conn, gr_key, "")
+                    )
             if updated:
                 self._send(200, {"ok": True, **updated})
             else:
@@ -4877,7 +5283,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(400, {"error": f"too large (> {max_bytes} bytes)"})
                 return
             if not allow and looks_like_secret(body):
-                self._send(400, {"error": "looks like a secret; enable allow_secrets to force save"})
+                self._send(
+                    400,
+                    {
+                        "error": "looks like a secret; enable allow_secrets to force save"
+                    },
+                )
                 return
             digest = hashlib.sha256(body.encode("utf-8", errors="ignore")).hexdigest()
             existing_id = get_clip_id_by_hash(conn, digest)
@@ -4928,7 +5339,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(400, {"error": f"too large (> {max_bytes} bytes)"})
                 return
             if not allow and looks_like_secret(body):
-                self._send(400, {"error": "looks like a secret; enable allow_secrets to force save"})
+                self._send(
+                    400,
+                    {
+                        "error": "looks like a secret; enable allow_secrets to force save"
+                    },
+                )
                 return
             digest = hashlib.sha256(body.encode("utf-8", errors="ignore")).hexdigest()
             existing_id = get_clip_id_by_hash(conn, digest)
@@ -5002,9 +5418,13 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 timeout = float(timeout)
             except Exception:
                 timeout = 8.0
-            ok, msg, new_id, out = run_user_helper_on_clip(conn, kind, target_id, timeout=timeout)
+            ok, msg, new_id, out = run_user_helper_on_clip(
+                conn, kind, target_id, timeout=timeout
+            )
             if ok:
-                self._send(200, {"ok": True, "id": new_id, "message": msg, "output": out})
+                self._send(
+                    200, {"ok": True, "id": new_id, "message": msg, "output": out}
+                )
             else:
                 self._send(400, {"error": msg})
             return
@@ -5030,9 +5450,13 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             save = bool(data.get("save"))
             setting_key = "ai_recall_cmd" if kind == "recall" else "ai_fill_cmd"
             tag_label = kind
-            ok, msg, new_id, out = run_ai_helper(conn, setting_key, hours, limit, timeout, save=save, tag_label=tag_label)
+            ok, msg, new_id, out = run_ai_helper(
+                conn, setting_key, hours, limit, timeout, save=save, tag_label=tag_label
+            )
             if ok:
-                self._send(200, {"ok": True, "id": new_id, "message": msg, "output": out})
+                self._send(
+                    200, {"ok": True, "id": new_id, "message": msg, "output": out}
+                )
             else:
                 self._send(400, {"error": msg})
             return
@@ -5104,7 +5528,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             app = data.get("remove") or data.get("app")
             if app:
                 removed = remove_blocked_app(conn, str(app))
-                self._send(200, {"ok": removed, "blocklist": sorted(get_blocklist(conn))})
+                self._send(
+                    200, {"ok": removed, "blocklist": sorted(get_blocklist(conn))}
+                )
             else:
                 self._send(400, {"error": "missing app"})
             return
@@ -5118,7 +5544,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     gate = enforce_license_gate(conn, FATHER)
     if not gate["device_allowed"]:
-        say(FATHER, "device not licensed; refusing to serve. Free up a device slot or upgrade.")
+        say(
+            FATHER,
+            "device not licensed; refusing to serve. Free up a device slot or upgrade.",
+        )
         return
     federation_requested = get_bool_setting(conn, "federation_enabled", False)
     if federation_requested and not gate["federation"]:
@@ -5164,22 +5593,53 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="my--father-mother: local clipboard memory")
+    parser = argparse.ArgumentParser(
+        description="my--father-mother: local clipboard memory"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_init = sub.add_parser("init", help="initialize the database")
     p_init.set_defaults(func=cmd_init)
 
     p_watch = sub.add_parser("watch", help="start clipboard watcher")
-    p_watch.add_argument("--interval", type=float, default=1.0, help="poll interval in seconds")
-    p_watch.add_argument("--cap", type=int, default=2000, help="max clips to retain (0 = unlimited)")
-    p_watch.add_argument("--max-bytes", type=int, default=None, help="max bytes per clip (default from settings or 16384)")
-    p_watch.add_argument("--allow-secrets", action="store_true", help="capture even if text looks like a secret")
-    p_watch.add_argument("--redact", action="store_true", help="redact secrets instead of skipping when allow_secrets is false")
-    p_watch.add_argument("--embedder", choices=["hash", "e5-small"], help="embedding model for new captures (default from config)")
+    p_watch.add_argument(
+        "--interval", type=float, default=1.0, help="poll interval in seconds"
+    )
+    p_watch.add_argument(
+        "--cap", type=int, default=2000, help="max clips to retain (0 = unlimited)"
+    )
+    p_watch.add_argument(
+        "--max-bytes",
+        type=int,
+        default=None,
+        help="max bytes per clip (default from settings or 16384)",
+    )
+    p_watch.add_argument(
+        "--allow-secrets",
+        action="store_true",
+        help="capture even if text looks like a secret",
+    )
+    p_watch.add_argument(
+        "--redact",
+        action="store_true",
+        help="redact secrets instead of skipping when allow_secrets is false",
+    )
+    p_watch.add_argument(
+        "--embedder",
+        choices=["hash", "e5-small"],
+        help="embedding model for new captures (default from config)",
+    )
     g_notify = p_watch.add_mutually_exclusive_group()
-    g_notify.add_argument("--notify", action="store_true", help="show a macOS notification when clips are saved/skipped")
-    g_notify.add_argument("--no-notify", action="store_true", help="disable notifications even if enabled in config")
+    g_notify.add_argument(
+        "--notify",
+        action="store_true",
+        help="show a macOS notification when clips are saved/skipped",
+    )
+    g_notify.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="disable notifications even if enabled in config",
+    )
     p_watch.set_defaults(func=cmd_watch)
 
     p_recent = sub.add_parser("recent", help="show recent clips")
@@ -5205,15 +5665,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--pins-only", action="store_true", help="only pinned clips")
     p_search.set_defaults(func=cmd_search)
 
-    p_ssearch = sub.add_parser("semantic-search", help="semantic search using hash or e5-small embeddings")
+    p_ssearch = sub.add_parser(
+        "semantic-search", help="semantic search using hash or e5-small embeddings"
+    )
     p_ssearch.add_argument("query", help="query text")
     p_ssearch.add_argument("--limit", type=int, default=10)
-    p_ssearch.add_argument("--pool", type=int, default=2000, help="pool size to score (higher = more accurate)")
+    p_ssearch.add_argument(
+        "--pool",
+        type=int,
+        default=2000,
+        help="pool size to score (higher = more accurate)",
+    )
     p_ssearch.add_argument("--app", help="filter by source app (case-insensitive)")
     p_ssearch.add_argument("--tag", help="filter by tag")
-    p_ssearch.add_argument("--embedder", choices=["hash", "e5-small"], help="embedding model to use (default from config)")
+    p_ssearch.add_argument(
+        "--embedder",
+        choices=["hash", "e5-small"],
+        help="embedding model to use (default from config)",
+    )
     p_ssearch.add_argument("--since", help="ISO timestamp lower bound")
-    p_ssearch.add_argument("--since-hours", type=float, help="look back this many hours")
+    p_ssearch.add_argument(
+        "--since-hours", type=float, help="look back this many hours"
+    )
     p_ssearch.add_argument("--until", help="ISO timestamp upper bound")
     p_ssearch.add_argument("--pins-only", action="store_true", help="only pinned clips")
     p_ssearch.set_defaults(func=cmd_semantic_search)
@@ -5225,7 +5698,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_stats = sub.add_parser("stats", help="show clip count and db size")
     p_stats.set_defaults(func=cmd_stats)
 
-    p_status = sub.add_parser("status", help="runtime status (paused/notify/secrets/config)")
+    p_status = sub.add_parser(
+        "status", help="runtime status (paused/notify/secrets/config)"
+    )
     p_status.add_argument("--json", action="store_true", help="emit JSON payload")
     p_status.set_defaults(func=cmd_status)
 
@@ -5237,9 +5712,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_settings = sub.add_parser("settings", help="show or update settings parity")
     group_settings = p_settings.add_mutually_exclusive_group()
-    group_settings.add_argument("--list-keys", action="store_true", help="list settings keys")
+    group_settings.add_argument(
+        "--list-keys", action="store_true", help="list settings keys"
+    )
     group_settings.add_argument("--get", help="get a settings key")
-    group_settings.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a settings key")
+    group_settings.add_argument(
+        "--set", nargs=2, metavar=("KEY", "VALUE"), help="set a settings key"
+    )
     p_settings.add_argument("--json", action="store_true", help="print JSON output")
     p_settings.set_defaults(func=cmd_settings)
 
@@ -5247,29 +5726,49 @@ def build_parser() -> argparse.ArgumentParser:
     p_copilot.add_argument("--set-model", help="set default copilot model")
     p_copilot.add_argument("--set-accent", help="set copilot accent color")
     g_copilot_ltm = p_copilot.add_mutually_exclusive_group()
-    g_copilot_ltm.add_argument("--use-ltm", action="store_true", help="enable LTM context by default")
-    g_copilot_ltm.add_argument("--no-use-ltm", action="store_true", help="disable LTM context by default")
-    p_copilot.add_argument("--add", action="store_true", help="add a copilot chat from text/path/stdin")
+    g_copilot_ltm.add_argument(
+        "--use-ltm", action="store_true", help="enable LTM context by default"
+    )
+    g_copilot_ltm.add_argument(
+        "--no-use-ltm", action="store_true", help="disable LTM context by default"
+    )
+    p_copilot.add_argument(
+        "--add", action="store_true", help="add a copilot chat from text/path/stdin"
+    )
     p_copilot.add_argument("--text", help="chat content")
     p_copilot.add_argument("--path", help="path to chat content")
-    p_copilot.add_argument("--stdin", action="store_true", help="read chat content from stdin")
+    p_copilot.add_argument(
+        "--stdin", action="store_true", help="read chat content from stdin"
+    )
     p_copilot.add_argument("--title", help="chat title")
     p_copilot.add_argument("--chat-model", help="override model for this chat")
-    p_copilot.add_argument("--list", action="store_true", help="list recent copilot chats")
+    p_copilot.add_argument(
+        "--list", action="store_true", help="list recent copilot chats"
+    )
     p_copilot.add_argument("--limit", type=int, default=10, help="max chats to list")
-    p_copilot.add_argument("--clear", action="store_true", help="delete all copilot chats")
-    p_copilot.add_argument("--yes", action="store_true", help="confirm destructive actions")
+    p_copilot.add_argument(
+        "--clear", action="store_true", help="delete all copilot chats"
+    )
+    p_copilot.add_argument(
+        "--yes", action="store_true", help="confirm destructive actions"
+    )
     p_copilot.add_argument("--status", action="store_true", help="show copilot status")
     p_copilot.set_defaults(func=cmd_copilot)
 
     p_ml = sub.add_parser("ml", help="manage machine learning/LTM settings")
-    p_ml.add_argument("--context-level", help="set auto-context level (off/low/medium/high)")
-    p_ml.add_argument("--processing-mode", help="set processing mode (local/cloud/blended)")
+    p_ml.add_argument(
+        "--context-level", help="set auto-context level (off/low/medium/high)"
+    )
+    p_ml.add_argument(
+        "--processing-mode", help="set processing mode (local/cloud/blended)"
+    )
     g_ltm = p_ml.add_mutually_exclusive_group()
     g_ltm.add_argument("--ltm-on", action="store_true", help="enable LTM engine")
     g_ltm.add_argument("--ltm-off", action="store_true", help="disable LTM engine")
     p_ml.add_argument("--permissions", help="set LTM permissions note")
-    p_ml.add_argument("--clear-older-than-days", type=int, help="clear clips older than N days")
+    p_ml.add_argument(
+        "--clear-older-than-days", type=int, help="clear clips older than N days"
+    )
     p_ml.add_argument("--clear-since", help="clear clips since ISO timestamp")
     p_ml.add_argument("--clear-until", help="clear clips until ISO timestamp")
     p_ml.add_argument("--clear-all", action="store_true", help="clear all clips")
@@ -5300,27 +5799,47 @@ def build_parser() -> argparse.ArgumentParser:
     p_show.set_defaults(func=cmd_show)
 
     p_export = sub.add_parser("export", help="export clips to JSON (stdout or file)")
-    p_export.add_argument("--limit", type=int, default=1000, help="number of clips to export")
+    p_export.add_argument(
+        "--limit", type=int, default=1000, help="number of clips to export"
+    )
     p_export.add_argument("--path", help="path to write JSON (default stdout)")
     p_export.add_argument("--app", help="filter by source app (case-insensitive)")
     p_export.add_argument("--tag", help="filter by tag")
     p_export.set_defaults(func=cmd_export)
 
-    p_export_md = sub.add_parser("export-md", help="export recent clips as markdown outline")
-    p_export_md.add_argument("--hours", type=float, help="look back this many hours (optional)")
-    p_export_md.add_argument("--limit", type=int, default=200, help="max clips to include")
+    p_export_md = sub.add_parser(
+        "export-md", help="export recent clips as markdown outline"
+    )
+    p_export_md.add_argument(
+        "--hours", type=float, help="look back this many hours (optional)"
+    )
+    p_export_md.add_argument(
+        "--limit", type=int, default=200, help="max clips to include"
+    )
     p_export_md.add_argument("--path", help="write to file (default stdout)")
     p_export_md.set_defaults(func=cmd_export_md)
 
     p_config = sub.add_parser("config", help="get/set config (max_bytes)")
     group_cfg = p_config.add_mutually_exclusive_group(required=True)
-    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
-    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
+    group_cfg.add_argument(
+        "--get",
+        help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)",
+    )
+    group_cfg.add_argument(
+        "--set",
+        nargs=2,
+        metavar=("KEY", "VALUE"),
+        help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)",
+    )
     p_config.set_defaults(func=cmd_config)
 
     p_purge = sub.add_parser("purge", help="purge clips by age/app/keep-last/all")
-    p_purge.add_argument("--older-than-days", type=int, help="delete clips older than N days (optional)")
-    p_purge.add_argument("--keep-last", type=int, help="keep last N clips (delete the rest)")
+    p_purge.add_argument(
+        "--older-than-days", type=int, help="delete clips older than N days (optional)"
+    )
+    p_purge.add_argument(
+        "--keep-last", type=int, help="keep last N clips (delete the rest)"
+    )
     p_purge.add_argument("--app", help="only purge for a specific app")
     p_purge.add_argument("--tag", help="only purge for a specific tag")
     p_purge.add_argument("--all", action="store_true", help="delete all clips")
@@ -5347,14 +5866,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_copy.set_defaults(func=cmd_copy)
 
     p_backup = sub.add_parser("backup", help="backup the database to a path")
-    p_backup.add_argument("--path", required=True, help="destination path for backup file")
+    p_backup.add_argument(
+        "--path", required=True, help="destination path for backup file"
+    )
     p_backup.set_defaults(func=cmd_backup)
 
     p_restore = sub.add_parser("restore", help="restore the database from a path")
     p_restore.add_argument("--path", required=True, help="source path of backup file")
     p_restore.set_defaults(func=cmd_restore)
 
-    p_sync = sub.add_parser("sync", help="push/pull DB to/from a target path (e.g. iCloud/drive)")
+    p_sync = sub.add_parser(
+        "sync", help="push/pull DB to/from a target path (e.g. iCloud/drive)"
+    )
     p_sync.add_argument("--mode", choices=["push", "pull"], default="push")
     p_sync.add_argument("--target", help="override sync_target config")
     p_sync.set_defaults(func=cmd_sync)
@@ -5364,10 +5887,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="encrypt and upload a DB snapshot to an S3-compatible bucket (config backup_bucket)",
     )
     p_cloud_backup.add_argument(
-        "--loop", action="store_true", help="run continuously, uploading every --interval seconds"
+        "--loop",
+        action="store_true",
+        help="run continuously, uploading every --interval seconds",
     )
     p_cloud_backup.add_argument(
-        "--interval", type=int, default=DEFAULT_BACKUP_INTERVAL,
+        "--interval",
+        type=int,
+        default=DEFAULT_BACKUP_INTERVAL,
         help="seconds between uploads in --loop mode (default 3600 = hourly)",
     )
     p_cloud_backup.set_defaults(func=cmd_cloud_backup)
@@ -5380,59 +5907,125 @@ def build_parser() -> argparse.ArgumentParser:
     p_ingest = sub.add_parser("ingest-file", help="ingest a text/code file into clips")
     p_ingest.add_argument("--path", required=True, help="path to file")
     p_ingest.add_argument("--max-bytes", type=int, default=None)
-    p_ingest.add_argument("--allow-secrets", action="store_true", help="override allow_secrets for this ingest")
-    p_ingest.add_argument("--allow-pdf", action="store_true", help="allow pdf ingestion (requires pdftotext)")
-    p_ingest.add_argument("--embedder", choices=["hash", "e5-small"], help="embedding model for this ingest (default from config)")
+    p_ingest.add_argument(
+        "--allow-secrets",
+        action="store_true",
+        help="override allow_secrets for this ingest",
+    )
+    p_ingest.add_argument(
+        "--allow-pdf",
+        action="store_true",
+        help="allow pdf ingestion (requires pdftotext)",
+    )
+    p_ingest.add_argument(
+        "--embedder",
+        choices=["hash", "e5-small"],
+        help="embedding model for this ingest (default from config)",
+    )
     p_ingest.add_argument("--tag", action="append", help="tag(s) to attach")
     p_ingest.set_defaults(func=cmd_ingest_file)
 
-    p_inbox = sub.add_parser("watch-inbox", help="watch a directory and ingest new/changed files")
-    p_inbox.add_argument("--dir", default=str(Path.home() / ".my-father-mother" / "inbox"))
+    p_inbox = sub.add_parser(
+        "watch-inbox", help="watch a directory and ingest new/changed files"
+    )
+    p_inbox.add_argument(
+        "--dir", default=str(Path.home() / ".my-father-mother" / "inbox")
+    )
     p_inbox.add_argument("--interval", type=float, default=5.0)
     p_inbox.add_argument("--max-bytes", type=int, default=None)
-    p_inbox.add_argument("--allow-secrets", action="store_true", help="allow secrets while ingesting")
-    p_inbox.add_argument("--allow-pdf", action="store_true", help="allow pdf ingestion (requires pdftotext)")
-    p_inbox.add_argument("--embedder", choices=["hash", "e5-small"], help="embedding model for inbox ingests (default from config)")
-    p_inbox.add_argument("--tag", action="append", help="tag(s) to attach to ingested files")
+    p_inbox.add_argument(
+        "--allow-secrets", action="store_true", help="allow secrets while ingesting"
+    )
+    p_inbox.add_argument(
+        "--allow-pdf",
+        action="store_true",
+        help="allow pdf ingestion (requires pdftotext)",
+    )
+    p_inbox.add_argument(
+        "--embedder",
+        choices=["hash", "e5-small"],
+        help="embedding model for inbox ingests (default from config)",
+    )
+    p_inbox.add_argument(
+        "--tag", action="append", help="tag(s) to attach to ingested files"
+    )
     p_inbox.set_defaults(func=cmd_watch_inbox)
 
     p_img = sub.add_parser("ingest-image", help="ingest an image via OCR (tesseract)")
     p_img.add_argument("--path", required=True, help="path to image")
     p_img.add_argument("--max-bytes", type=int, default=None)
-    p_img.add_argument("--allow-secrets", action="store_true", help="override allow_secrets for this ingest")
-    p_img.add_argument("--embedder", choices=["hash", "e5-small"], help="embedding model (default from config)")
-    p_img.add_argument("--allow-images", action="store_true", help="temporarily allow image OCR ingestion")
+    p_img.add_argument(
+        "--allow-secrets",
+        action="store_true",
+        help="override allow_secrets for this ingest",
+    )
+    p_img.add_argument(
+        "--embedder",
+        choices=["hash", "e5-small"],
+        help="embedding model (default from config)",
+    )
+    p_img.add_argument(
+        "--allow-images",
+        action="store_true",
+        help="temporarily allow image OCR ingestion",
+    )
     p_img.set_defaults(func=cmd_ingest_image)
 
-    p_meeting = sub.add_parser("ingest-transcript", help="ingest a meeting transcript/text and tag it")
+    p_meeting = sub.add_parser(
+        "ingest-transcript", help="ingest a meeting transcript/text and tag it"
+    )
     p_meeting.add_argument("--path", required=True, help="path to transcript file")
     p_meeting.add_argument("--max-bytes", type=int, default=None)
-    p_meeting.add_argument("--allow-secrets", action="store_true", help="override allow_secrets for this ingest")
-    p_meeting.add_argument("--embedder", choices=["hash", "e5-small"], help="embedding model (default from config)")
+    p_meeting.add_argument(
+        "--allow-secrets",
+        action="store_true",
+        help="override allow_secrets for this ingest",
+    )
+    p_meeting.add_argument(
+        "--embedder",
+        choices=["hash", "e5-small"],
+        help="embedding model (default from config)",
+    )
     p_meeting.add_argument("--tag", action="append", help="extra tag(s) to attach")
     p_meeting.set_defaults(func=cmd_ingest_transcript)
 
-    p_fed = sub.add_parser("federate-import", help="import clips from an export file or URL (simple federation)")
+    p_fed = sub.add_parser(
+        "federate-import",
+        help="import clips from an export file or URL (simple federation)",
+    )
     p_fed.add_argument("--path", help="path to JSON export")
     p_fed.add_argument("--url", help="URL returning JSON export")
     p_fed.set_defaults(func=cmd_federate_import)
 
-    p_helper_rewrite = sub.add_parser("rewrite", help="run helper rewrite script on a clip (stdin=clip, stdout=rewrite)")
+    p_helper_rewrite = sub.add_parser(
+        "rewrite",
+        help="run helper rewrite script on a clip (stdin=clip, stdout=rewrite)",
+    )
     p_helper_rewrite.add_argument("--id", type=int, help="clip id (default latest)")
     p_helper_rewrite.add_argument("--timeout", type=float, default=8.0)
-    p_helper_rewrite.add_argument("--show", action="store_true", help="print helper output")
+    p_helper_rewrite.add_argument(
+        "--show", action="store_true", help="print helper output"
+    )
     p_helper_rewrite.set_defaults(func=cmd_rewrite)
 
-    p_helper_shorten = sub.add_parser("shorten", help="run helper shorten script on a clip")
+    p_helper_shorten = sub.add_parser(
+        "shorten", help="run helper shorten script on a clip"
+    )
     p_helper_shorten.add_argument("--id", type=int, help="clip id (default latest)")
     p_helper_shorten.add_argument("--timeout", type=float, default=8.0)
-    p_helper_shorten.add_argument("--show", action="store_true", help="print helper output")
+    p_helper_shorten.add_argument(
+        "--show", action="store_true", help="print helper output"
+    )
     p_helper_shorten.set_defaults(func=cmd_shorten)
 
-    p_helper_extract = sub.add_parser("extract", help="run helper extract script on a clip")
+    p_helper_extract = sub.add_parser(
+        "extract", help="run helper extract script on a clip"
+    )
     p_helper_extract.add_argument("--id", type=int, help="clip id (default latest)")
     p_helper_extract.add_argument("--timeout", type=float, default=8.0)
-    p_helper_extract.add_argument("--show", action="store_true", help="print helper output")
+    p_helper_extract.add_argument(
+        "--show", action="store_true", help="print helper output"
+    )
     p_helper_extract.set_defaults(func=cmd_extract)
 
     p_note = sub.add_parser("note", help="append and view notes for a clip")
@@ -5440,46 +6033,79 @@ def build_parser() -> argparse.ArgumentParser:
     p_note.add_argument("--text", help="note text to append")
     p_note.set_defaults(func=cmd_note)
 
-    p_recall = sub.add_parser("recall", help="run recall helper over recent clips (off by default)")
-    p_recall.add_argument("--hours", type=float, help="look back this many hours (optional)")
+    p_recall = sub.add_parser(
+        "recall", help="run recall helper over recent clips (off by default)"
+    )
+    p_recall.add_argument(
+        "--hours", type=float, help="look back this many hours (optional)"
+    )
     p_recall.add_argument("--limit", type=int, default=50, help="max clips to send")
     p_recall.add_argument("--timeout", type=float, default=12.0)
-    p_recall.add_argument("--save", action="store_true", help="save helper output as a clip tagged recall")
+    p_recall.add_argument(
+        "--save", action="store_true", help="save helper output as a clip tagged recall"
+    )
     p_recall.add_argument("--show", action="store_true", help="print helper output")
     p_recall.set_defaults(func=cmd_recall)
 
-    p_fill = sub.add_parser("fill", help="run fill/gaps helper over recent clips (off by default)")
-    p_fill.add_argument("--hours", type=float, help="look back this many hours (optional)")
+    p_fill = sub.add_parser(
+        "fill", help="run fill/gaps helper over recent clips (off by default)"
+    )
+    p_fill.add_argument(
+        "--hours", type=float, help="look back this many hours (optional)"
+    )
     p_fill.add_argument("--limit", type=int, default=50, help="max clips to send")
     p_fill.add_argument("--timeout", type=float, default=12.0)
-    p_fill.add_argument("--save", action="store_true", help="save helper output as a clip tagged fill")
+    p_fill.add_argument(
+        "--save", action="store_true", help="save helper output as a clip tagged fill"
+    )
     p_fill.add_argument("--show", action="store_true", help="print helper output")
     p_fill.set_defaults(func=cmd_fill)
 
-    p_related = sub.add_parser("related", help="semantic related clips for a given clip id")
+    p_related = sub.add_parser(
+        "related", help="semantic related clips for a given clip id"
+    )
     p_related.add_argument("--id", type=int, required=True)
     p_related.add_argument("--limit", type=int, default=10)
-    p_related.add_argument("--pool", type=int, default=2000, help="pool size to score (higher = more accurate)")
+    p_related.add_argument(
+        "--pool",
+        type=int,
+        default=2000,
+        help="pool size to score (higher = more accurate)",
+    )
     p_related.add_argument("--app", help="filter by source app")
     p_related.add_argument("--tag", help="filter by tag")
     p_related.set_defaults(func=cmd_related)
 
-    p_recap = sub.add_parser("recap", help="session recap grouped by app within a timeframe")
-    p_recap.add_argument("--minutes", type=int, default=60, help="lookback window in minutes")
+    p_recap = sub.add_parser(
+        "recap", help="session recap grouped by app within a timeframe"
+    )
+    p_recap.add_argument(
+        "--minutes", type=int, default=60, help="lookback window in minutes"
+    )
     p_recap.add_argument("--limit", type=int, default=200, help="max clips to consider")
     p_recap.set_defaults(func=cmd_recap)
 
-    p_context = sub.add_parser("context", help="dump recent context bundle for LLMs/sidecars")
+    p_context = sub.add_parser(
+        "context", help="dump recent context bundle for LLMs/sidecars"
+    )
     p_context.add_argument("--limit", type=int, default=20, help="max clips")
     p_context.add_argument("--app", help="filter by app")
     p_context.add_argument("--tag", help="filter by tag")
-    p_context.add_argument("--since-hours", type=float, help="look back this many hours")
+    p_context.add_argument(
+        "--since-hours", type=float, help="look back this many hours"
+    )
     p_context.add_argument("--pins-only", action="store_true", help="only pinned clips")
     p_context.set_defaults(func=cmd_context)
 
-    p_topics = sub.add_parser("topics", help="group recent clips into topic buckets (tags/apps)")
-    p_topics.add_argument("--limit", type=int, default=8, help="max topic buckets to show")
-    p_topics.add_argument("--per-group", type=int, default=5, help="max items per bucket")
+    p_topics = sub.add_parser(
+        "topics", help="group recent clips into topic buckets (tags/apps)"
+    )
+    p_topics.add_argument(
+        "--limit", type=int, default=8, help="max topic buckets to show"
+    )
+    p_topics.add_argument(
+        "--per-group", type=int, default=5, help="max items per bucket"
+    )
     p_topics.add_argument("--app", help="filter by source app before grouping")
     p_topics.add_argument("--tag", help="filter by tag before grouping")
     p_topics.add_argument("--since", help="ISO timestamp lower bound")
@@ -5490,20 +6116,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_palette = sub.add_parser("palette", help="interactive picker to copy a clip")
     p_palette.add_argument("--query", help="filter text (uses FTS if provided)")
-    p_palette.add_argument("--semantic", action="store_true", help="use semantic search instead of FTS")
+    p_palette.add_argument(
+        "--semantic", action="store_true", help="use semantic search instead of FTS"
+    )
     p_palette.add_argument("--app", help="filter by app")
     p_palette.add_argument("--tag", help="filter by tag")
     p_palette.add_argument("--limit", type=int, default=30, help="max items to show")
-    p_palette.add_argument("--embedder", choices=["hash", "e5-small"], help="embedding model for semantic mode (default from config)")
+    p_palette.add_argument(
+        "--embedder",
+        choices=["hash", "e5-small"],
+        help="embedding model for semantic mode (default from config)",
+    )
     p_palette.add_argument("--pins-only", action="store_true", help="only pinned clips")
-    p_palette.add_argument("--since-hours", type=float, help="look back this many hours")
+    p_palette.add_argument(
+        "--since-hours", type=float, help="look back this many hours"
+    )
     p_palette.set_defaults(func=cmd_palette)
 
-    p_launch = sub.add_parser("install-launchagent", help="write/remove LaunchAgent for watcher")
+    p_launch = sub.add_parser(
+        "install-launchagent", help="write/remove LaunchAgent for watcher"
+    )
     p_launch.add_argument("--cap", type=int, default=2000, help="cap passed to watcher")
-    p_launch.add_argument("--interval", type=float, default=1.0, help="interval passed to watcher")
-    p_launch.add_argument("--allow-secrets", action="store_true", help="allow secrets in watcher")
-    p_launch.add_argument("--remove", action="store_true", help="remove the LaunchAgent file")
+    p_launch.add_argument(
+        "--interval", type=float, default=1.0, help="interval passed to watcher"
+    )
+    p_launch.add_argument(
+        "--allow-secrets", action="store_true", help="allow secrets in watcher"
+    )
+    p_launch.add_argument(
+        "--remove", action="store_true", help="remove the LaunchAgent file"
+    )
     p_launch.set_defaults(func=cmd_install_launchagent)
 
     p_serve = sub.add_parser("serve", help="start local HTTP API server")
