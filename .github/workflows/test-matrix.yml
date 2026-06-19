@@ -1,0 +1,36 @@
+name: test-matrix
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+jobs:
+  test-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: [ "3.10", "3.11", "3.12" ]
+    name: test-matrix (py${{ matrix.python-version }})
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # The project is stdlib-only at runtime; tests only need pytest.
+          # Optional deps (sentence-transformers, langdetect) are intentionally
+          # omitted — the code falls back gracefully and the suite covers that path.
+          python -m pip install pytest
+
+      - name: Run test suite
+        run: python -m pytest tests/ -q
