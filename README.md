@@ -122,7 +122,7 @@ The Mother watcher loop follows this pipeline on each tick (default: 1-second in
 
 ### HTTP Server
 
-The `serve` command starts a local HTTP server (default port 8765) that exposes the full retrieval API plus a minimal web UI at the root path. The server tries up to 3 consecutive ports if the requested port is busy. Endpoints mirror CLI commands: `/recent`, `/search`, `/semantic_search`, `/context`, `/clip`, `/status`, `/pin`, `/tags`, `/dropper`, `/ingest_url`, `/recap`, `/topics`, `/federate_export`, `/federate_import`.
+The `serve` command starts a local HTTP server (default port 8765) that exposes the full retrieval API plus a minimal web UI at the root path. The server tries up to 3 consecutive ports if the requested port is busy. Endpoints mirror CLI commands, including retrieval (`/recent`, `/search`, `/semantic_search`, `/context`, `/clip`), management (`/status`, `/config`, `/pin`, `/tags`, `/notes`), ingest (`/dropper`, `/ingest_url`), and federation (`/federate_export`, `/federate_import`). See [docs/API.md](docs/API.md) for the full customer reference.
 
 ### MCP Bridge
 
@@ -376,22 +376,38 @@ Navigate to `http://127.0.0.1:8765/` for a minimal but functional web UI with se
 
 ### API Endpoints
 
+For complete request/response schemas, authentication details, and customer
+integration examples, see [docs/API.md](docs/API.md).
+
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/recent` | Recent clips (params: `limit`, `app`, `tag`, `pins_only`, `since`, `until`) |
-| GET | `/search` | FTS5 keyword search (params: `q`, `limit`, `app`, `tag`) |
-| GET | `/semantic_search` | Semantic search (params: `q`, `limit`) |
+| GET | `/health` | Health check |
+| GET | `/stats` | Clip count and database size |
+| GET | `/recent` | Recent clips (params: `limit`, `app`, `tag`, `pins_only`, `since`, `until`, `hours`) |
+| GET | `/search` | FTS5 keyword search (params: `q`, `limit`, `app`, `tag`, `pins_only`, `since`, `until`, `hours`) |
+| GET | `/semantic_search` | Semantic search (params: `q`, `limit`, `pool`, `embedder`, filters) |
 | GET | `/context` | Context bundle for LLM sidecars (params: `limit`, `app`, `tag`, `hours`, `pins_only`) |
 | GET | `/clip` | Single clip by ID (params: `id`) |
 | GET | `/status` | Runtime status (paused, notify, DB size, caps) |
+| GET | `/settings` | Customer settings snapshot |
+| GET | `/config` | Runtime configuration subset |
+| POST | `/config` | Update runtime configuration |
 | GET | `/recap` | Recent activity summary (params: `minutes`) |
-| GET | `/topics` | Topic buckets (params: `limit`, `per_group`, `since_hours`) |
+| GET | `/topics` | Topic buckets (params: `limit`, `per_group`, `hours`, filters) |
 | GET | `/tags` | List all tags |
+| GET | `/blocklist` | List blocked capture apps |
+| POST | `/blocklist` | Add a blocked capture app |
+| DELETE | `/blocklist` | Remove a blocked capture app |
 | POST | `/pin` | Pin/unpin a clip (`{"id": N, "pinned": true}`) |
+| POST | `/notes` | Add a note to a clip (`{"id": N, "note": "..."}`) |
+| POST | `/pause` | Pause clipboard capture |
+| POST | `/resume` | Resume clipboard capture |
 | POST | `/dropper` | Browser extension ingest (`{"url", "title", "selection", "html", "app"}`) |
 | POST | `/ingest_url` | Bookmarklet ingest (`{"url", "title", "selection"}`) |
 | GET | `/federate_export` | Export clips as JSON for federation |
 | POST | `/federate_import` | Import clips from a peer |
+| POST | `/purge` | Delete clips by policy |
+| POST | `/webhooks/gumroad` | Signed Gumroad license webhook |
 
 ---
 
