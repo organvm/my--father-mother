@@ -2647,6 +2647,11 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key in ("backup_passphrase", "backup_secret_key"):
             secret = get_setting(conn, key, "")
             say(FATHER, f"{key}={'***set***' if secret else ''}")
+        elif key in ("gumroad_permalink", "gumroad_license_key"):
+            say(FATHER, f"{key}={get_setting(conn, key, '')}")
+        elif key == "gumroad_webhook_secret":
+            secret = get_setting(conn, key, "")
+            say(FATHER, f"{key}={'***set***' if secret else ''}")
         elif key == "ai_recall_cmd":
             say(FATHER, f"ai_recall_cmd={get_setting(conn, 'ai_recall_cmd', '')}")
         elif key == "ai_fill_cmd":
@@ -2758,6 +2763,12 @@ def cmd_config(args: argparse.Namespace) -> None:
             set_setting(conn, key, value)
             say(FATHER, f"set {key}={value}")
         elif key in ("backup_passphrase", "backup_secret_key"):
+            set_setting(conn, key, value)
+            say(FATHER, f"set {key} (hidden)")
+        elif key in ("gumroad_permalink", "gumroad_license_key"):
+            set_setting(conn, key, value)
+            say(FATHER, f"set {key}={value}")
+        elif key == "gumroad_webhook_secret":
             set_setting(conn, key, value)
             say(FATHER, f"set {key} (hidden)")
         elif key == "ai_recall_cmd":
