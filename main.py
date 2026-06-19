@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -58,6 +59,15 @@ EMBED_DIM = 128
 DEFAULT_EVICT_MODE = "fifo"  # fifo|tiered
 DEFAULT_ALLOW_PDF = False
 DEFAULT_ALLOW_IMAGES = False
+
+# Gumroad licensing ($49 lifetime). The product is sold via Gumroad; purchases
+# fire a webhook at /webhooks/gumroad which we HMAC-verify before storing the
+# license key. validate_license() re-checks the stored key against Gumroad on
+# startup (best-effort; offline runs keep the last known verdict).
+GUMROAD_PRICE_USD = 49
+DEFAULT_GUMROAD_PERMALINK = "myfathermother"  # Gumroad product permalink/short code
+GUMROAD_VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
+GUMROAD_SIG_HEADER = "X-Gumroad-Signature"
 ALLOWED_EXTS = {
     ".txt",
     ".md",
@@ -710,6 +720,104 @@ def get_bool_setting(conn: sqlite3.Connection, key: str, default: bool) -> bool:
     raw = get_setting(conn, key, "1" if default else "0")
     parsed = parse_bool_value(raw)
     return default if parsed is None else parsed
+
+
+# --- Gumroad licensing -------------------------------------------------------
+
+def gumroad_webhook_secret(conn: sqlite3.Connection) -> str:
+    """Shared secret used to HMAC-verify incoming Gumroad webhooks.
+
+    Configurable via `config --set gumroad_webhook_secret ...` or the
+    GUMROAD_WEBHOOK_SECRET environment variable (env takes precedence so the
+    secret never has to live in the DB).
+    """
+    env = os.environ.get("GUMROAD_WEBHOOK_SECRET", "").strip()
+    if env:
+        return env
+    return get_setting(conn, "gumroad_webhook_secret", "").strip()
+
+
+def verify_gumroad_signature(secret: str, raw_body: bytes, signature: str) -> bool:
+    """Constant-time check of an HMAC-SHA256 hex signature over the raw body."""
+    if not secret or not signature:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    # Tolerate "sha256=" prefixes some senders add.
+    provided = signature.strip()
+    if "=" in provided:
+        provided = provided.split("=", 1)[1].strip()
+    return hmac.compare_digest(expected, provided)
+
+
+def store_gumroad_license(conn: sqlite3.Connection, fields: dict) -> str:
+    """Persist the license key (and a few useful sale fields) from a webhook.
+
+    Returns the stored license key (empty string if none was present).
+    """
+    license_key = str(fields.get("license_key") or "").strip()
+    if license_key:
+        set_setting(conn, "gumroad_license_key", license_key)
+    for src, dst in (
+        ("email", "gumroad_email"),
+        ("product_permalink", "gumroad_permalink"),
+        ("sale_id", "gumroad_sale_id"),
+        ("product_id", "gumroad_product_id"),
+    ):
+        val = str(fields.get(src) or "").strip()
+        if val:
+            set_setting(conn, dst, val)
+    return license_key
+
+
+def _gumroad_verify_online(permalink: str, license_key: str) -> Optional[dict]:
+    """Call Gumroad's license-verify API. Returns parsed JSON, or None on any
+    network/transport error so callers can fall back to the cached verdict."""
+    payload = urllib.parse.urlencode(
+        {
+            "product_permalink": permalink,
+            "license_key": license_key,
+            # Don't burn an activation count just to check validity on startup.
+            "increment_uses_count": "false",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(GUMROAD_VERIFY_URL, data=payload, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def validate_license(conn: sqlite3.Connection, online: bool = True) -> dict:
+    """Validate the stored Gumroad license; called on `serve` startup.
+
+    Best-effort: if Gumroad can't be reached we keep the last cached verdict so
+    offline use of an already-validated license keeps working.
+    """
+    license_key = get_setting(conn, "gumroad_license_key", "").strip()
+    if not license_key:
+        set_setting(conn, "license_valid", "0")
+        say(FATHER, f"no Gumroad license found — running unlicensed (${GUMROAD_PRICE_USD} lifetime at gumroad.com)")
+        return {"valid": False, "reason": "no_license"}
+
+    permalink = get_setting(conn, "gumroad_permalink", DEFAULT_GUMROAD_PERMALINK).strip() or DEFAULT_GUMROAD_PERMALINK
+    if online:
+        result = _gumroad_verify_online(permalink, license_key)
+        if result is not None:
+            valid = bool(result.get("success"))
+            refunded = bool((result.get("purchase") or {}).get("refunded"))
+            valid = valid and not refunded
+            set_setting(conn, "license_valid", "1" if valid else "0")
+            if valid:
+                say(FATHER, "Gumroad license verified — thank you for your purchase")
+            else:
+                say(FATHER, "Gumroad license could not be verified (invalid or refunded)")
+            return {"valid": valid, "reason": "verified" if valid else "rejected"}
+
+    # Offline (or online check skipped): trust the cached verdict.
+    cached = get_bool_setting(conn, "license_valid", False)
+    say(FATHER, f"Gumroad license present (cached status: {'valid' if cached else 'unverified'})")
+    return {"valid": cached, "reason": "cached"}
 
 
 def get_sync_interval(conn: sqlite3.Connection) -> float:
@@ -3533,6 +3641,29 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _read_raw_body(self) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
+    @staticmethod
+    def _parse_body_fields(raw: bytes, content_type: str) -> dict:
+        """Parse a webhook body into a flat dict. Gumroad sends form-encoded
+        data; we also accept JSON as a convenience."""
+        ctype = (content_type or "").lower()
+        if "application/json" in ctype:
+            try:
+                data = json.loads(raw or b"{}")
+                return data if isinstance(data, dict) else {}
+            except json.JSONDecodeError:
+                return {}
+        parsed = urllib.parse.parse_qs(raw.decode("utf-8", errors="ignore"))
+        return {k: v[0] for k, v in parsed.items() if v}
+
     def log_message(self, format: str, *args) -> None:
         # Quiet by default
         return
@@ -4198,6 +4329,28 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         path = self.path
         conn = self.conn
         init_db(conn)
+        if path == "/webhooks/gumroad":
+            raw = self._read_raw_body()
+            secret = gumroad_webhook_secret(conn)
+            if not secret:
+                self._send(503, {"error": "gumroad webhook secret not configured"})
+                return
+            signature = self.headers.get(GUMROAD_SIG_HEADER, "")
+            if not verify_gumroad_signature(secret, raw, signature):
+                self._send(401, {"error": "invalid signature"})
+                return
+            fields = self._parse_body_fields(raw, self.headers.get("Content-Type", ""))
+            license_key = store_gumroad_license(conn, fields)
+            if not license_key:
+                self._send(400, {"error": "missing license_key"})
+                return
+            # Re-validate the freshly-stored key (best-effort, never fatal).
+            try:
+                status = validate_license(conn)
+            except Exception:
+                status = {"valid": get_bool_setting(conn, "license_valid", False)}
+            self._send(200, {"ok": True, "stored": True, "license_valid": bool(status.get("valid"))})
+            return
         if path == "/pin":
             data = self._parse_json()
             try:
@@ -4303,6 +4456,11 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             if "ai_fill_cmd" in data:
                 set_setting(conn, "ai_fill_cmd", str(data["ai_fill_cmd"]))
                 updated["ai_fill_cmd"] = get_setting(conn, "ai_fill_cmd", "")
+            for gr_key in ("gumroad_webhook_secret", "gumroad_permalink", "gumroad_license_key"):
+                if gr_key in data:
+                    set_setting(conn, gr_key, str(data[gr_key]))
+                    # Never echo the secret back in the response.
+                    updated[gr_key] = "***" if gr_key == "gumroad_webhook_secret" else get_setting(conn, gr_key, "")
             if updated:
                 self._send(200, {"ok": True, **updated})
             else:
@@ -4570,6 +4728,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
 def cmd_serve(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    validate_license(conn)
 
     def handler(*h_args, **h_kwargs):
         return ApiHandler(*h_args, conn=conn, **h_kwargs)
