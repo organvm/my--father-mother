@@ -54,6 +54,26 @@ DEFAULT_MAX_BYTES = 16_384  # ~16 KB
 DEFAULT_NOTIFY = False
 DEFAULT_WATCH_SYNC_INTERVAL = 60.0
 DEFAULT_EMBEDDER = "hash"  # or "e5-small"
+
+# ---------- Licensing ----------
+# Tiered gate: free is local-only with a small cap and hash embeddings;
+# pro unlocks a larger cap, multiple devices, semantic embeddings and federation.
+DEFAULT_LICENSE_TYPE = "free"
+LICENSE_UPGRADE_URL = "https://my-father-mother.local/upgrade"
+LICENSE_TIERS: dict[str, dict] = {
+    "free": {
+        "max_clips": 5_000,
+        "max_devices": 1,
+        "embedders": ("hash",),
+        "federation": False,
+    },
+    "pro": {
+        "max_clips": 50_000,
+        "max_devices": 3,
+        "embedders": ("hash", "e5-small"),
+        "federation": True,
+    },
+}
 E5_MODEL_NAME = "intfloat/e5-small-v2"
 EMBED_DIM = 128
 DEFAULT_EVICT_MODE = "fifo"  # fifo|tiered
@@ -282,6 +302,24 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_copilot_chats_created ON copilot_chats(created_at);
         """
     )
+    # license gate: track distinct devices for per-tier device caps
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS devices (
+            device_id TEXT PRIMARY KEY,
+            hostname TEXT,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+        );
+        """
+    )
+    # seed the license tier so `config --get license_type` is meaningful on fresh DBs
+    cur = conn.execute("SELECT 1 FROM settings WHERE key = 'license_type'")
+    if cur.fetchone() is None:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('license_type', ?)",
+            (DEFAULT_LICENSE_TYPE,),
+        )
     conn.commit()
 
 
@@ -641,6 +679,8 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "blocklist_size": len(get_blocklist(conn)),
         "sync_target": get_setting(conn, "sync_target", ""),
         "sync_interval": get_sync_interval(conn),
+        "license_type": get_license_type(conn, None),
+        "device_count": conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"],
     }
 
 
@@ -1215,6 +1255,132 @@ def set_embedder(conn: sqlite3.Connection, name: str) -> None:
     set_setting(conn, "embedder", kind)
 
 
+# ---------- License gate ----------
+def get_license_type(conn: sqlite3.Connection, override: Optional[str] = None) -> str:
+    if override:
+        val = override.strip().lower()
+    else:
+        val = get_setting(conn, "license_type", DEFAULT_LICENSE_TYPE).strip().lower()
+    return val if val in LICENSE_TIERS else DEFAULT_LICENSE_TYPE
+
+
+def set_license_type(conn: sqlite3.Connection, name: str) -> str:
+    kind = name.strip().lower()
+    if kind not in LICENSE_TIERS:
+        kind = DEFAULT_LICENSE_TYPE
+    set_setting(conn, "license_type", kind)
+    return kind
+
+
+def license_limits(conn: sqlite3.Connection, override: Optional[str] = None) -> dict:
+    lt = get_license_type(conn, override)
+    return {"license_type": lt, **LICENSE_TIERS[lt]}
+
+
+def device_identity() -> tuple[str, str]:
+    """Return a stable (device_id, hostname) for this machine."""
+    hostname = platform.node() or "unknown-host"
+    raw = f"{hostname}|{platform.platform()}|{os.environ.get('USER', '')}"
+    device_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return device_id, hostname
+
+
+def register_device(conn: sqlite3.Connection, max_devices: int) -> tuple[bool, int]:
+    """Register/refresh this device. Returns (allowed, total_device_count).
+
+    Already-known devices are always allowed (and refreshed). A new device is
+    only admitted while the registered count is below the tier's device cap.
+    """
+    device_id, hostname = device_identity()
+    now = datetime.now(timezone.utc).isoformat()
+    known = conn.execute(
+        "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
+    ).fetchone()
+    if known:
+        conn.execute(
+            "UPDATE devices SET last_seen = ?, hostname = ? WHERE device_id = ?",
+            (now, hostname, device_id),
+        )
+        conn.commit()
+        count = conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"]
+        return True, count
+    count = conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"]
+    if count >= max_devices:
+        return False, count
+    conn.execute(
+        "INSERT INTO devices(device_id, hostname, first_seen, last_seen) VALUES(?, ?, ?, ?)",
+        (device_id, hostname, now, now),
+    )
+    conn.commit()
+    return True, count + 1
+
+
+def enforce_license_gate(
+    conn: sqlite3.Connection,
+    persona: str,
+    *,
+    requested_cap: Optional[int] = None,
+    requested_embedder: Optional[str] = None,
+) -> dict:
+    """Resolve effective limits for an entry point and warn-upgrade past free caps.
+
+    Returns a dict with the resolved license type, the effective clip cap, the
+    effective embedder, whether this device is licensed, and the federation flag.
+    Emits human-facing warnings via ``say`` but never raises — capture/serve keep
+    working in a degraded (free-tier) mode.
+    """
+    info = license_limits(conn)
+    lt = info["license_type"]
+    max_clips = info["max_clips"]
+
+    # Device gate
+    device_allowed, device_count = register_device(conn, info["max_devices"])
+    if not device_allowed:
+        say(
+            persona,
+            f"[license:{lt}] device limit reached "
+            f"({device_count}/{info['max_devices']} active). This device is not "
+            f"licensed under the {lt} tier. Upgrade for more devices: {LICENSE_UPGRADE_URL}",
+        )
+
+    # Embedder gate: free is hash-only
+    effective_embedder = get_embedder(conn, requested_embedder)
+    if effective_embedder not in info["embedders"]:
+        say(
+            persona,
+            f"[license:{lt}] embedder '{effective_embedder}' requires pro; "
+            f"falling back to 'hash'. Upgrade: {LICENSE_UPGRADE_URL}",
+        )
+        effective_embedder = "hash"
+
+    # Clip cap gate: the license ceiling always wins (treat 0/None as "unlimited"
+    # request, still bounded by the tier cap).
+    if requested_cap and requested_cap > 0:
+        effective_cap = min(requested_cap, max_clips)
+    else:
+        effective_cap = max_clips
+
+    # Warn-upgrade if existing clip count already sits at/over the free ceiling.
+    total = conn.execute("SELECT COUNT(*) AS c FROM clips").fetchone()["c"]
+    if total >= max_clips:
+        say(
+            persona,
+            f"[license:{lt}] at clip cap ({total}/{max_clips}); oldest clips will be "
+            f"evicted. Upgrade for more capacity: {LICENSE_UPGRADE_URL}",
+        )
+
+    return {
+        "license_type": lt,
+        "effective_cap": effective_cap,
+        "effective_embedder": effective_embedder,
+        "device_allowed": device_allowed,
+        "device_count": device_count,
+        "max_devices": info["max_devices"],
+        "max_clips": max_clips,
+        "federation": info["federation"],
+    }
+
+
 def tokenize(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9_]+", text.lower())
 
@@ -1695,7 +1861,18 @@ def cmd_watch(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     notify_override: Optional[bool] = True if args.notify else False if args.no_notify else None
     notify_enabled = get_notify(conn, notify_override)
-    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
+    gate = enforce_license_gate(
+        conn,
+        MOTHER,
+        requested_cap=cap,
+        requested_embedder=getattr(args, "embedder", None),
+    )
+    cap = gate["effective_cap"]
+    embedder_choice = gate["effective_embedder"]
+    if not gate["device_allowed"]:
+        say(MOTHER, "device not licensed; not capturing. Free up a device slot or upgrade.")
+        return
+    say(MOTHER, f"license={gate['license_type']} cap={cap} embedder={embedder_choice}")
     cap_by_app = get_cap_map(conn, "cap_by_app")
     auto_summary_cmd = get_setting(conn, "auto_summary_cmd", "").strip()
     auto_tag_cmd = get_setting(conn, "auto_tag_cmd", "").strip()
@@ -2141,7 +2318,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     latest = snap["latest"] or "n/a"
     say(
         FATHER,
-        f"capture={'paused' if snap['paused'] else 'active'}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
+        f"capture={'paused' if snap['paused'] else 'active'}, license={snap['license_type']}, devices={snap['device_count']}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
         f"ltm={snap['ltm_enabled']}, ml_context={snap['ml_context_level']}, ml_mode={snap['ml_processing_mode']}, "
         f"max_bytes={snap['max_bytes']}, max_db_mb={snap['max_db_mb']}, evict_mode={snap['evict_mode']}, clips={snap['count']}, latest={latest}, db={snap['db_size_mb']:.2f} MB, blocklisted_apps={snap['blocklist_size']}, cap_by_app={snap['cap_by_app']}, cap_by_tag={snap['cap_by_tag']}",
     )
@@ -2668,6 +2845,17 @@ def cmd_config(args: argparse.Namespace) -> None:
             say(FATHER, f"ml_processing_mode={get_setting(conn, 'ml_processing_mode', DEFAULT_ML_PROCESSING_MODE)}")
         elif key == "ltm_enabled":
             say(FATHER, f"ltm_enabled={get_bool_setting(conn, 'ltm_enabled', DEFAULT_LTM_ENABLED)}")
+        elif key == "license_type":
+            lt = get_license_type(conn, None)
+            limits = LICENSE_TIERS[lt]
+            say(
+                FATHER,
+                f"license_type={lt} (max_clips={limits['max_clips']}, "
+                f"max_devices={limits['max_devices']}, embedders={'/'.join(limits['embedders'])}, "
+                f"federation={limits['federation']})",
+            )
+        elif key == "federation_enabled":
+            say(FATHER, f"federation_enabled={get_bool_setting(conn, 'federation_enabled', False)}")
         else:
             say(FATHER, f"unknown key '{key}'")
         return
@@ -2805,6 +2993,21 @@ def cmd_config(args: argparse.Namespace) -> None:
             elif value.lower() in ("0", "false", "no", "off"):
                 set_bool_setting(conn, "ltm_enabled", False)
                 say(FATHER, "set ltm_enabled=False")
+            else:
+                say(FATHER, "value must be true/false or 1/0")
+        elif key == "license_type":
+            if value.strip().lower() in LICENSE_TIERS:
+                lt = set_license_type(conn, value)
+                say(FATHER, f"set license_type={lt}")
+            else:
+                say(FATHER, f"license_type must be one of: {', '.join(sorted(LICENSE_TIERS))}")
+        elif key == "federation_enabled":
+            if value.lower() in ("1", "true", "yes", "on"):
+                set_bool_setting(conn, "federation_enabled", True)
+                say(FATHER, "set federation_enabled=True")
+            elif value.lower() in ("0", "false", "no", "off"):
+                set_bool_setting(conn, "federation_enabled", False)
+                say(FATHER, "set federation_enabled=False")
             else:
                 say(FATHER, "value must be true/false or 1/0")
         else:
@@ -4913,6 +5116,24 @@ def cmd_serve(args: argparse.Namespace) -> None:
     init_db(conn)
     validate_license(conn)
 
+    gate = enforce_license_gate(conn, FATHER)
+    if not gate["device_allowed"]:
+        say(FATHER, "device not licensed; refusing to serve. Free up a device slot or upgrade.")
+        return
+    federation_requested = get_bool_setting(conn, "federation_enabled", False)
+    if federation_requested and not gate["federation"]:
+        say(
+            FATHER,
+            f"[license:{gate['license_type']}] federation is a pro feature; serving "
+            f"in local-only mode. Upgrade: {LICENSE_UPGRADE_URL}",
+        )
+    federation_active = federation_requested and gate["federation"]
+    say(
+        FATHER,
+        f"license={gate['license_type']} devices={gate['device_count']}/{gate['max_devices']} "
+        f"federation={'on' if federation_active else 'off'}",
+    )
+
     def handler(*h_args, **h_kwargs):
         return ApiHandler(*h_args, conn=conn, **h_kwargs)
 
@@ -5093,8 +5314,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="get/set config (max_bytes)")
     group_cfg = p_config.add_mutually_exclusive_group(required=True)
-    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
-    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
+    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
     p_config.set_defaults(func=cmd_config)
 
     p_purge = sub.add_parser("purge", help="purge clips by age/app/keep-last/all")
