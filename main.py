@@ -27,6 +27,7 @@ from typing import Optional, Tuple, Iterable, Dict
 
 DB_DIR = Path.home() / ".my-father-mother"
 DB_PATH = DB_DIR / "mfm.db"
+ICLOUD_DRIVE_DIR = Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
 
 MOTHER = "mother"  # capture persona (moon domain)
 FATHER = "father"  # retrieval persona (sun domain)
@@ -50,6 +51,7 @@ DEFAULT_PERSONAL_CLOUD_STATUS = "disconnected"
 
 DEFAULT_MAX_BYTES = 16_384  # ~16 KB
 DEFAULT_NOTIFY = False
+DEFAULT_WATCH_SYNC_INTERVAL = 60.0
 DEFAULT_EMBEDDER = "hash"  # or "e5-small"
 E5_MODEL_NAME = "intfloat/e5-small-v2"
 EMBED_DIM = 128
@@ -628,23 +630,43 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "db_size_mb": round((s.get("db_size_bytes", 0) or 0) / (1024 * 1024), 3),
         "blocklist_size": len(get_blocklist(conn)),
         "sync_target": get_setting(conn, "sync_target", ""),
+        "sync_interval": get_sync_interval(conn),
     }
 
 
 def resolve_sync_target(target: str) -> Path:
-    dest = Path(target).expanduser()
-    if dest.is_dir() or str(target).endswith("/"):
+    target_raw = str(target).strip()
+    if target_raw.lower() == "icloud":
+        return ICLOUD_DRIVE_DIR / "mfm.db"
+    dest = Path(target_raw).expanduser()
+    if dest.is_dir() or target_raw.endswith("/"):
         dest = dest / "mfm.db"
     return dest
 
 
-def sync_push(target: str) -> tuple[bool, str]:
-    dest = resolve_sync_target(target)
+def write_db_snapshot(dest: Path, source_conn: Optional[sqlite3.Connection] = None) -> None:
+    """Write a consistent SQLite snapshot to dest, including committed WAL pages."""
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if not DB_PATH.exists():
+    owned_conn = source_conn is None
+    src = source_conn or sqlite3.connect(DB_PATH)
+    try:
+        src.commit()
+        with sqlite3.connect(dest) as dst:
+            src.backup(dst)
+    finally:
+        if owned_conn:
+            src.close()
+
+
+def sync_push(target: str, source_conn: Optional[sqlite3.Connection] = None) -> tuple[bool, str]:
+    dest = resolve_sync_target(target)
+    if source_conn is None and not DB_PATH.exists():
         return False, "local DB missing; run init?"
-    shutil.copy2(DB_PATH, dest)
-    return True, f"pushed db to {dest}"
+    try:
+        write_db_snapshot(dest, source_conn)
+    except Exception as e:
+        return False, f"push failed: {e}"
+    return True, f"pushed db snapshot to {dest}"
 
 
 def sync_pull(target: str) -> tuple[bool, str]:
@@ -688,6 +710,34 @@ def get_bool_setting(conn: sqlite3.Connection, key: str, default: bool) -> bool:
     raw = get_setting(conn, key, "1" if default else "0")
     parsed = parse_bool_value(raw)
     return default if parsed is None else parsed
+
+
+def get_sync_interval(conn: sqlite3.Connection) -> float:
+    raw = get_setting(conn, "sync_interval", str(DEFAULT_WATCH_SYNC_INTERVAL)).strip()
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return DEFAULT_WATCH_SYNC_INTERVAL
+
+
+def maybe_watch_sync(
+    conn: sqlite3.Connection,
+    last_sync_at: Optional[float],
+    last_sync_target: str,
+) -> tuple[Optional[float], str]:
+    target = get_setting(conn, "sync_target", "").strip()
+    if not target:
+        return last_sync_at, ""
+
+    now = time.monotonic()
+    interval = get_sync_interval(conn)
+    target_changed = target != last_sync_target
+    if target_changed or last_sync_at is None or (now - last_sync_at) >= interval:
+        ok, msg = sync_push(target, conn)
+        prefix = "watch sync" if ok else "watch sync failed"
+        say(MOTHER, f"{prefix}: {msg}")
+        return now, target
+    return last_sync_at, target
 
 
 def set_bool_setting(conn: sqlite3.Connection, key: str, value: bool) -> None:
@@ -803,6 +853,7 @@ def settings_snapshot(conn: sqlite3.Connection) -> dict:
             "domain": get_setting_typed(conn, "personal_cloud_domain"),
             "last_updated": get_setting_typed(conn, "personal_cloud_last_updated"),
             "sync_target": get_setting(conn, "sync_target", ""),
+            "sync_interval": get_sync_interval(conn),
         },
         "copilot": {
             "model": get_setting_typed(conn, "copilot_model"),
@@ -1541,6 +1592,14 @@ def cmd_watch(args: argparse.Namespace) -> None:
     auto_tag_cmd = get_setting(conn, "auto_tag_cmd", "").strip()
     last_digest = None
     last_paused = None
+    last_sync_at: Optional[float] = None
+    last_sync_target = ""
+
+    def finish_tick() -> None:
+        nonlocal last_sync_at, last_sync_target
+        last_sync_at, last_sync_target = maybe_watch_sync(conn, last_sync_at, last_sync_target)
+        time.sleep(interval)
+
     say(MOTHER, "watching clipboard... Ctrl+C to stop.")
     try:
         while True:
@@ -1549,7 +1608,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 if last_paused is not True:
                     say(MOTHER, "paused; not capturing.")
                 last_paused = True
-                time.sleep(interval)
+                finish_tick()
                 continue
             if last_paused is True:
                 say(MOTHER, "resumed capture.")
@@ -1570,7 +1629,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     blockset = get_blocklist(conn)
                     if app.strip().lower() in blockset:
                         last_digest = digest
-                        time.sleep(interval)
+                        finish_tick()
                         continue
                     clip_bytes = clip.encode("utf-8", errors="ignore")
                     if len(clip_bytes) > max_bytes:
@@ -1578,7 +1637,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         if notify_enabled:
                             toast("Mother skipped large clip", f"{app} ({len(clip_bytes)} bytes)")
                         last_digest = digest
-                        time.sleep(interval)
+                        finish_tick()
                         continue
                     if not allow_secrets and looks_like_secret(clip):
                         if args.redact:
@@ -1588,7 +1647,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                             if notify_enabled:
                                 toast("Mother skipped secret-looking clip", app or "unknown")
                             last_digest = digest
-                            time.sleep(interval)
+                            finish_tick()
                             continue
 
                     existing_id = get_clip_id_by_hash(conn, digest)
@@ -1643,7 +1702,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                                 if notify_enabled:
                                     toast("Mother nearing DB cap", msg)
                     last_digest = digest
-            time.sleep(interval)
+            finish_tick()
     except KeyboardInterrupt:
         say(MOTHER, "stopped.")
 
@@ -2030,6 +2089,7 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, f"  domain={format_setting_value(cloud.get('domain'))}")
     say(FATHER, f"  last_updated={format_setting_value(cloud.get('last_updated'))}")
     say(FATHER, f"  sync_target={format_setting_value(cloud.get('sync_target'))}")
+    say(FATHER, f"  sync_interval={format_setting_value(cloud.get('sync_interval'))}")
     say(FATHER, "  backup_restore=use `backup` / `restore` commands")
 
     copilot = snap["copilot"]
@@ -2470,6 +2530,8 @@ def cmd_config(args: argparse.Namespace) -> None:
             say(FATHER, f"auto_tag_cmd={get_setting(conn, 'auto_tag_cmd', '')}")
         elif key == "sync_target":
             say(FATHER, f"sync_target={get_setting(conn, 'sync_target', '')}")
+        elif key == "sync_interval":
+            say(FATHER, f"sync_interval={get_sync_interval(conn)}")
         elif key == "ai_recall_cmd":
             say(FATHER, f"ai_recall_cmd={get_setting(conn, 'ai_recall_cmd', '')}")
         elif key == "ai_fill_cmd":
@@ -2570,6 +2632,13 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key == "sync_target":
             set_setting(conn, "sync_target", value)
             say(FATHER, f"set sync_target={value}")
+        elif key == "sync_interval":
+            try:
+                floatval = max(1.0, float(value))
+                set_setting(conn, "sync_interval", str(floatval))
+                say(FATHER, f"set sync_interval={floatval}")
+            except ValueError:
+                say(FATHER, "value must be a number of seconds")
         elif key == "ai_recall_cmd":
             set_setting(conn, "ai_recall_cmd", value)
             say(FATHER, "set ai_recall_cmd")
@@ -2753,15 +2822,11 @@ def cmd_copy(args: argparse.Namespace) -> None:
 
 
 def cmd_backup(args: argparse.Namespace) -> None:
-    init_db(connect_db())
-    if not DB_PATH.exists():
-        say(FATHER, "no database found")
-        return
+    conn = connect_db()
+    init_db(conn)
     dest = Path(args.path).expanduser()
-    dest.parent.mkdir(parents=True, exist_ok=True)
     try:
-        import shutil
-        shutil.copy2(DB_PATH, dest)
+        write_db_snapshot(dest, conn)
         say(FATHER, f"backup written to {dest}")
     except Exception as e:
         say(FATHER, f"backup failed: {e}")
@@ -2795,7 +2860,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
     if args.mode == "pull":
         ok, msg = sync_pull(target)
     else:
-        ok, msg = sync_push(target)
+        ok, msg = sync_push(target, conn)
     say(FATHER if ok else MOTHER, msg)
 
 
@@ -3988,6 +4053,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     "cap_by_tag": get_cap_map(conn, "cap_by_tag"),
                     "evict_mode": get_evict_mode(conn),
                     "sync_target": get_setting(conn, "sync_target", ""),
+                    "sync_interval": get_sync_interval(conn),
                     "ai_recall_cmd": get_setting(conn, "ai_recall_cmd", ""),
                     "ai_fill_cmd": get_setting(conn, "ai_fill_cmd", ""),
                     "helper_rewrite_cmd": get_setting(conn, "helper_rewrite_cmd", ""),
@@ -4223,6 +4289,14 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             if "sync_target" in data:
                 set_setting(conn, "sync_target", str(data["sync_target"]))
                 updated["sync_target"] = get_setting(conn, "sync_target", "")
+            if "sync_interval" in data:
+                try:
+                    floatval = max(1.0, float(data["sync_interval"]))
+                except ValueError:
+                    self._send(400, {"error": "invalid sync_interval"})
+                    return
+                set_setting(conn, "sync_interval", str(floatval))
+                updated["sync_interval"] = get_sync_interval(conn)
             if "ai_recall_cmd" in data:
                 set_setting(conn, "ai_recall_cmd", str(data["ai_recall_cmd"]))
                 updated["ai_recall_cmd"] = get_setting(conn, "ai_recall_cmd", "")
@@ -4677,8 +4751,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="get/set config (max_bytes)")
     group_cfg = p_config.add_mutually_exclusive_group(required=True)
-    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, ai_recall_cmd, ai_fill_cmd)")
-    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, ai_recall_cmd, ai_fill_cmd)")
     p_config.set_defaults(func=cmd_config)
 
     p_purge = sub.add_parser("purge", help="purge clips by age/app/keep-last/all")

@@ -457,6 +457,36 @@ class TestResolveSyncTarget:
         result = mfm.resolve_sync_target(str(tmp_path) + "/")
         assert result.name == "mfm.db"
 
+    def test_icloud_alias(self, tmp_path, monkeypatch):
+        icloud_dir = tmp_path / "CloudDocs"
+        monkeypatch.setattr(mfm, "ICLOUD_DRIVE_DIR", icloud_dir)
+        result = mfm.resolve_sync_target("icloud")
+        assert result == icloud_dir / "mfm.db"
+
+    def test_icloud_alias_is_trimmed_and_case_insensitive(self, tmp_path, monkeypatch):
+        icloud_dir = tmp_path / "CloudDocs"
+        monkeypatch.setattr(mfm, "ICLOUD_DRIVE_DIR", icloud_dir)
+        result = mfm.resolve_sync_target("  iCloud  ")
+        assert result == icloud_dir / "mfm.db"
+
+
+class TestSyncPush:
+    def test_icloud_push_writes_sqlite_snapshot(self, conn, tmp_path, monkeypatch):
+        icloud_dir = tmp_path / "CloudDocs"
+        monkeypatch.setattr(mfm, "ICLOUD_DRIVE_DIR", icloud_dir)
+        mfm.insert_clip(conn, "synced content", "Terminal", "zsh")
+
+        ok, msg = mfm.sync_push("icloud", conn)
+
+        assert ok is True
+        assert "pushed db snapshot" in msg
+        synced = sqlite3.connect(icloud_dir / "mfm.db")
+        try:
+            count = synced.execute("SELECT COUNT(*) FROM clips").fetchone()[0]
+        finally:
+            synced.close()
+        assert count == 1
+
 
 class TestStats:
     def test_empty_db(self, conn):
