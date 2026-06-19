@@ -854,6 +854,7 @@ def settings_snapshot(conn: sqlite3.Connection) -> dict:
             "last_updated": get_setting_typed(conn, "personal_cloud_last_updated"),
             "sync_target": get_setting(conn, "sync_target", ""),
             "sync_interval": get_sync_interval(conn),
+            "backup_bucket": get_setting(conn, "backup_bucket", ""),
         },
         "copilot": {
             "model": get_setting_typed(conn, "copilot_model"),
@@ -2090,7 +2091,8 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, f"  last_updated={format_setting_value(cloud.get('last_updated'))}")
     say(FATHER, f"  sync_target={format_setting_value(cloud.get('sync_target'))}")
     say(FATHER, f"  sync_interval={format_setting_value(cloud.get('sync_interval'))}")
-    say(FATHER, "  backup_restore=use `backup` / `restore` commands")
+    say(FATHER, f"  backup_bucket={format_setting_value(cloud.get('backup_bucket'))}")
+    say(FATHER, "  backup_restore=use `backup` / `restore` / `cloud-backup` commands")
 
     copilot = snap["copilot"]
     say(FATHER, "Copilot Chats")
@@ -2532,6 +2534,11 @@ def cmd_config(args: argparse.Namespace) -> None:
             say(FATHER, f"sync_target={get_setting(conn, 'sync_target', '')}")
         elif key == "sync_interval":
             say(FATHER, f"sync_interval={get_sync_interval(conn)}")
+        elif key in ("backup_bucket", "backup_endpoint", "backup_region", "backup_prefix", "backup_access_key"):
+            say(FATHER, f"{key}={get_setting(conn, key, '')}")
+        elif key in ("backup_passphrase", "backup_secret_key"):
+            secret = get_setting(conn, key, "")
+            say(FATHER, f"{key}={'***set***' if secret else ''}")
         elif key == "ai_recall_cmd":
             say(FATHER, f"ai_recall_cmd={get_setting(conn, 'ai_recall_cmd', '')}")
         elif key == "ai_fill_cmd":
@@ -2639,6 +2646,12 @@ def cmd_config(args: argparse.Namespace) -> None:
                 say(FATHER, f"set sync_interval={floatval}")
             except ValueError:
                 say(FATHER, "value must be a number of seconds")
+        elif key in ("backup_bucket", "backup_endpoint", "backup_region", "backup_prefix", "backup_access_key"):
+            set_setting(conn, key, value)
+            say(FATHER, f"set {key}={value}")
+        elif key in ("backup_passphrase", "backup_secret_key"):
+            set_setting(conn, key, value)
+            say(FATHER, f"set {key} (hidden)")
         elif key == "ai_recall_cmd":
             set_setting(conn, "ai_recall_cmd", value)
             say(FATHER, "set ai_recall_cmd")
@@ -2861,6 +2874,165 @@ def cmd_sync(args: argparse.Namespace) -> None:
         ok, msg = sync_pull(target)
     else:
         ok, msg = sync_push(target, conn)
+    say(FATHER if ok else MOTHER, msg)
+
+
+# --- S3-compatible encrypted backups (boto3 optional) ------------------------
+
+DEFAULT_BACKUP_PREFIX = "mfm-backups"
+DEFAULT_BACKUP_INTERVAL = 3600  # hourly
+
+
+def parse_s3_bucket(spec: str) -> Tuple[str, str]:
+    """Split a backup_bucket spec into (bucket, prefix).
+
+    Accepts ``bucket``, ``bucket/prefix``, or ``s3://bucket/prefix``.
+    """
+    spec = (spec or "").strip()
+    if spec.startswith("s3://"):
+        spec = spec[len("s3://"):]
+    spec = spec.strip("/")
+    if not spec:
+        return "", ""
+    if "/" in spec:
+        bucket, prefix = spec.split("/", 1)
+        return bucket, prefix.strip("/")
+    return spec, ""
+
+
+def snapshot_db_to(path: Path) -> None:
+    """Write a consistent snapshot of the live DB to ``path``.
+
+    Uses the SQLite online backup API so the snapshot is safe even while the
+    watcher is writing (WAL mode).
+    """
+    src = sqlite3.connect(str(DB_PATH))
+    try:
+        dst = sqlite3.connect(str(path))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
+def encrypt_file(src: Path, dst: Path, passphrase: str) -> Tuple[bool, str]:
+    """Encrypt ``src`` to ``dst`` with AES-256-CBC via the openssl CLI.
+
+    The passphrase is passed on stdin so it never appears in the process list.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt",
+                "-in", str(src), "-out", str(dst), "-pass", "stdin",
+            ],
+            input=passphrase.encode("utf-8"),
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return False, "openssl not found (required for encrypted backup)"
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", errors="replace").strip()
+        return False, err or "openssl encryption failed"
+    return True, "ok"
+
+
+def s3_upload(
+    local: Path,
+    bucket: str,
+    key: str,
+    *,
+    endpoint: str = "",
+    region: str = "",
+    access_key: str = "",
+    secret_key: str = "",
+) -> Tuple[bool, str]:
+    """Upload ``local`` to ``s3://bucket/key`` using boto3 (optional import)."""
+    try:
+        import boto3  # optional dependency
+    except ImportError:
+        return False, "boto3 not installed; pip install boto3"
+    client_kwargs: Dict[str, str] = {}
+    if endpoint:
+        client_kwargs["endpoint_url"] = endpoint
+    if region:
+        client_kwargs["region_name"] = region
+    if access_key and secret_key:
+        client_kwargs["aws_access_key_id"] = access_key
+        client_kwargs["aws_secret_access_key"] = secret_key
+    try:
+        client = boto3.client("s3", **client_kwargs)
+        client.upload_file(str(local), bucket, key)
+    except Exception as e:  # boto3/botocore raise many error types
+        return False, str(e)
+    return True, f"s3://{bucket}/{key}"
+
+
+def perform_cloud_backup(conn: sqlite3.Connection) -> Tuple[bool, str]:
+    """Snapshot, encrypt, and upload the DB to the configured S3 bucket."""
+    bucket_spec = get_setting(conn, "backup_bucket", "").strip()
+    if not bucket_spec:
+        return False, "set backup_bucket via config --set backup_bucket ..."
+    if not DB_PATH.exists():
+        return False, "no database found; run init?"
+    passphrase = get_setting(conn, "backup_passphrase", "")
+    if not passphrase:
+        return (
+            False,
+            "set backup_passphrase via config --set backup_passphrase ... "
+            "(required to encrypt the snapshot)",
+        )
+    bucket, spec_prefix = parse_s3_bucket(bucket_spec)
+    if not bucket:
+        return False, f"could not parse bucket from backup_bucket={bucket_spec!r}"
+    prefix = get_setting(conn, "backup_prefix", "").strip() or spec_prefix or DEFAULT_BACKUP_PREFIX
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name = f"mfm-{ts}.db.enc"
+    key = f"{prefix.strip('/')}/{name}" if prefix else name
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="mfm-backup-") as td:
+        snap = Path(td) / "snapshot.db"
+        enc = Path(td) / "snapshot.db.enc"
+        try:
+            snapshot_db_to(snap)
+        except Exception as e:
+            return False, f"snapshot failed: {e}"
+        ok, msg = encrypt_file(snap, enc, passphrase)
+        if not ok:
+            return False, f"encrypt failed: {msg}"
+        ok, msg = s3_upload(
+            enc,
+            bucket,
+            key,
+            endpoint=get_setting(conn, "backup_endpoint", "").strip(),
+            region=get_setting(conn, "backup_region", "").strip(),
+            access_key=get_setting(conn, "backup_access_key", "").strip(),
+            secret_key=get_setting(conn, "backup_secret_key", "").strip(),
+        )
+        if not ok:
+            return False, f"upload failed: {msg}"
+    return True, f"encrypted backup uploaded to {msg}"
+
+
+def cmd_cloud_backup(args: argparse.Namespace) -> None:
+    conn = connect_db()
+    init_db(conn)
+    interval = max(60, int(getattr(args, "interval", DEFAULT_BACKUP_INTERVAL) or DEFAULT_BACKUP_INTERVAL))
+    if getattr(args, "loop", False):
+        say(FATHER, f"cloud-backup loop started (every {interval}s); ctrl-c to stop")
+        try:
+            while True:
+                ok, msg = perform_cloud_backup(conn)
+                say(FATHER if ok else MOTHER, msg)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            say(FATHER, "cloud-backup loop stopped")
+        return
+    ok, msg = perform_cloud_backup(conn)
     say(FATHER if ok else MOTHER, msg)
 
 
@@ -4751,8 +4923,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="get/set config (max_bytes)")
     group_cfg = p_config.add_mutually_exclusive_group(required=True)
-    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, ai_recall_cmd, ai_fill_cmd)")
-    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
     p_config.set_defaults(func=cmd_config)
 
     p_purge = sub.add_parser("purge", help="purge clips by age/app/keep-last/all")
@@ -4795,6 +4967,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--mode", choices=["push", "pull"], default="push")
     p_sync.add_argument("--target", help="override sync_target config")
     p_sync.set_defaults(func=cmd_sync)
+
+    p_cloud_backup = sub.add_parser(
+        "cloud-backup",
+        help="encrypt and upload a DB snapshot to an S3-compatible bucket (config backup_bucket)",
+    )
+    p_cloud_backup.add_argument(
+        "--loop", action="store_true", help="run continuously, uploading every --interval seconds"
+    )
+    p_cloud_backup.add_argument(
+        "--interval", type=int, default=DEFAULT_BACKUP_INTERVAL,
+        help="seconds between uploads in --loop mode (default 3600 = hourly)",
+    )
+    p_cloud_backup.set_defaults(func=cmd_cloud_backup)
 
     p_hist = sub.add_parser("history", help="show capture history for a clip")
     p_hist.add_argument("--id", type=int, required=True)
