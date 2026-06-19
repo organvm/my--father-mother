@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -49,48 +48,16 @@ DEFAULT_UI_CONFIRMATIONS = "default"
 DEFAULT_UI_METRICS = "default"
 DEFAULT_UI_TOOLBAR = "suggested"
 DEFAULT_PERSONAL_CLOUD_STATUS = "disconnected"
-DEFAULT_LICENSE_TYPE = "free"  # free|pro
-GUMROAD_UPGRADE_URL = "https://gumroad.com/l/my-father-mother-pro"
 
 DEFAULT_MAX_BYTES = 16_384  # ~16 KB
 DEFAULT_NOTIFY = False
 DEFAULT_WATCH_SYNC_INTERVAL = 60.0
 DEFAULT_EMBEDDER = "hash"  # or "e5-small"
-
-# ---------- Licensing ----------
-# Tiered gate: free is local-only with a small cap and hash embeddings;
-# pro unlocks a larger cap, multiple devices, semantic embeddings and federation.
-DEFAULT_LICENSE_TYPE = "free"
-LICENSE_UPGRADE_URL = "https://my-father-mother.local/upgrade"
-LICENSE_TIERS: dict[str, dict] = {
-    "free": {
-        "max_clips": 5_000,
-        "max_devices": 1,
-        "embedders": ("hash",),
-        "federation": False,
-    },
-    "pro": {
-        "max_clips": 50_000,
-        "max_devices": 3,
-        "embedders": ("hash", "e5-small"),
-        "federation": True,
-    },
-}
-DEFAULT_PRO_ENABLED = False
 E5_MODEL_NAME = "intfloat/e5-small-v2"
 EMBED_DIM = 128
 DEFAULT_EVICT_MODE = "fifo"  # fifo|tiered
 DEFAULT_ALLOW_PDF = False
 DEFAULT_ALLOW_IMAGES = False
-
-# Gumroad licensing ($49 lifetime). The product is sold via Gumroad; purchases
-# fire a webhook at /webhooks/gumroad which we HMAC-verify before storing the
-# license key. validate_license() re-checks the stored key against Gumroad on
-# startup (best-effort; offline runs keep the last known verdict).
-GUMROAD_PRICE_USD = 49
-DEFAULT_GUMROAD_PERMALINK = "myfathermother"  # Gumroad product permalink/short code
-GUMROAD_VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
-GUMROAD_SIG_HEADER = "X-Gumroad-Signature"
 ALLOWED_EXTS = {
     ".txt",
     ".md",
@@ -170,7 +137,7 @@ def toast(title: str, text: str) -> None:
 # ---------- Database setup ----------
 def connect_db() -> sqlite3.Connection:
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
@@ -305,24 +272,6 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_copilot_chats_created ON copilot_chats(created_at);
         """
     )
-    # license gate: track distinct devices for per-tier device caps
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS devices (
-            device_id TEXT PRIMARY KEY,
-            hostname TEXT,
-            first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL
-        );
-        """
-    )
-    # seed the license tier so `config --get license_type` is meaningful on fresh DBs
-    cur = conn.execute("SELECT 1 FROM settings WHERE key = 'license_type'")
-    if cur.fetchone() is None:
-        conn.execute(
-            "INSERT INTO settings(key, value) VALUES('license_type', ?)",
-            (DEFAULT_LICENSE_TYPE,),
-        )
     conn.commit()
 
 
@@ -406,7 +355,8 @@ def insert_clip(
     )
     conn.commit()
     clip_id = cur.lastrowid
-    index_embedding_if_enabled(conn, clip_id, clean, embedder_override)
+    vec, model = embed_text(conn, clean, embedder_override)
+    store_embedding(conn, clip_id, vec, model)
     return clip_id
 
 
@@ -441,7 +391,8 @@ def insert_clip_import(
     )
     conn.commit()
     clip_id = cur.lastrowid
-    index_embedding_if_enabled(conn, clip_id, clean, None)
+    vec, model = embed_text(conn, clean, None)
+    store_embedding(conn, clip_id, vec, model)
     if tags:
         for t in tags:
             assign_tag(conn, clip_id, t)
@@ -665,7 +616,6 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "paused": is_paused(conn),
         "allow_secrets": get_allow_secrets(conn, None),
         "notify": get_notify(conn, None),
-        "pro_enabled": get_pro_enabled(conn),
         "embedder": get_embedder(conn, None),
         "max_bytes": get_max_bytes(conn, None),
         "max_db_mb": get_max_db_mb(conn, None),
@@ -681,9 +631,6 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "blocklist_size": len(get_blocklist(conn)),
         "sync_target": get_setting(conn, "sync_target", ""),
         "sync_interval": get_sync_interval(conn),
-        "license_type": get_license_type(conn, None),
-        "device_count": conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"],
-        "upgrade_url": get_setting(conn, "account_upgrade_url", "") or GUMROAD_UPGRADE_URL,
     }
 
 
@@ -765,112 +712,6 @@ def get_bool_setting(conn: sqlite3.Connection, key: str, default: bool) -> bool:
     return default if parsed is None else parsed
 
 
-# --- Gumroad licensing -------------------------------------------------------
-
-def gumroad_webhook_secret(conn: sqlite3.Connection) -> str:
-    """Shared secret used to HMAC-verify incoming Gumroad webhooks.
-
-    Configurable via `config --set gumroad_webhook_secret ...` or the
-    GUMROAD_WEBHOOK_SECRET environment variable (env takes precedence so the
-    secret never has to live in the DB).
-    """
-    env = os.environ.get("GUMROAD_WEBHOOK_SECRET", "").strip()
-    if env:
-        return env
-    return get_setting(conn, "gumroad_webhook_secret", "").strip()
-
-
-def verify_gumroad_signature(secret: str, raw_body: bytes, signature: str) -> bool:
-    """Constant-time check of an HMAC-SHA256 hex signature over the raw body."""
-    if not secret or not signature:
-        return False
-    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    # Tolerate "sha256=" prefixes some senders add.
-    provided = signature.strip()
-    if "=" in provided:
-        provided = provided.split("=", 1)[1].strip()
-    return hmac.compare_digest(expected, provided)
-
-
-def store_gumroad_license(conn: sqlite3.Connection, fields: dict) -> str:
-    """Persist the license key (and a few useful sale fields) from a webhook.
-
-    Returns the stored license key (empty string if none was present).
-    """
-    license_key = str(fields.get("license_key") or "").strip()
-    if license_key:
-        set_setting(conn, "gumroad_license_key", license_key)
-    for src, dst in (
-        ("email", "gumroad_email"),
-        ("product_permalink", "gumroad_permalink"),
-        ("sale_id", "gumroad_sale_id"),
-        ("product_id", "gumroad_product_id"),
-    ):
-        val = str(fields.get(src) or "").strip()
-        if val:
-            set_setting(conn, dst, val)
-    return license_key
-
-
-def _gumroad_verify_online(permalink: str, license_key: str) -> Optional[dict]:
-    """Call Gumroad's license-verify API. Returns parsed JSON, or None on any
-    network/transport error so callers can fall back to the cached verdict."""
-    payload = urllib.parse.urlencode(
-        {
-            "product_permalink": permalink,
-            "license_key": license_key,
-            # Don't burn an activation count just to check validity on startup.
-            "increment_uses_count": "false",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(GUMROAD_VERIFY_URL, data=payload, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="ignore"))
-    except Exception:
-        return None
-
-
-def validate_license(conn: sqlite3.Connection, online: bool = True) -> dict:
-    """Validate the stored Gumroad license; called on `serve` startup.
-
-    Best-effort: if Gumroad can't be reached we keep the last cached verdict so
-    offline use of an already-validated license keeps working.
-    """
-    license_key = get_setting(conn, "gumroad_license_key", "").strip()
-    if not license_key:
-        set_setting(conn, "license_valid", "0")
-        say(FATHER, f"no Gumroad license found — running unlicensed (${GUMROAD_PRICE_USD} lifetime at gumroad.com)")
-        return {"valid": False, "reason": "no_license"}
-
-    permalink = get_setting(conn, "gumroad_permalink", DEFAULT_GUMROAD_PERMALINK).strip() or DEFAULT_GUMROAD_PERMALINK
-    if online:
-        result = _gumroad_verify_online(permalink, license_key)
-        if result is not None:
-            valid = bool(result.get("success"))
-            refunded = bool((result.get("purchase") or {}).get("refunded"))
-            valid = valid and not refunded
-            set_setting(conn, "license_valid", "1" if valid else "0")
-            if valid:
-                say(FATHER, "Gumroad license verified — thank you for your purchase")
-            else:
-                say(FATHER, "Gumroad license could not be verified (invalid or refunded)")
-            return {"valid": valid, "reason": "verified" if valid else "rejected"}
-
-    # Offline (or online check skipped): trust the cached verdict.
-    cached = get_bool_setting(conn, "license_valid", False)
-    say(FATHER, f"Gumroad license present (cached status: {'valid' if cached else 'unverified'})")
-    return {"valid": cached, "reason": "cached"}
-
-
-def get_pro_enabled(conn: sqlite3.Connection) -> bool:
-    return get_bool_setting(conn, "pro_enabled", DEFAULT_PRO_ENABLED)
-
-
-def set_pro_enabled(conn: sqlite3.Connection, enabled: bool) -> None:
-    set_bool_setting(conn, "pro_enabled", enabled)
-
-
 def get_sync_interval(conn: sqlite3.Connection) -> float:
     raw = get_setting(conn, "sync_interval", str(DEFAULT_WATCH_SYNC_INTERVAL)).strip()
     try:
@@ -909,7 +750,6 @@ SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "account_linked": ("json", []),
     "account_orgs": ("json", []),
     "account_upgrade_url": ("str", ""),
-    "license_type": ("str", DEFAULT_LICENSE_TYPE),
     "personal_cloud_status": ("str", DEFAULT_PERSONAL_CLOUD_STATUS),
     "personal_cloud_domain": ("str", ""),
     "personal_cloud_last_updated": ("str", ""),
@@ -919,7 +759,6 @@ SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "ml_context_level": ("str", DEFAULT_ML_CONTEXT_LEVEL),
     "ml_processing_mode": ("str", DEFAULT_ML_PROCESSING_MODE),
     "ltm_enabled": ("bool", DEFAULT_LTM_ENABLED),
-    "pro_enabled": ("bool", DEFAULT_PRO_ENABLED),
     "ltm_permissions": ("str", "unknown"),
     "ui_default_view": ("str", DEFAULT_UI_VIEW),
     "ui_confirmations": ("str", DEFAULT_UI_CONFIRMATIONS),
@@ -1027,7 +866,6 @@ def settings_snapshot(conn: sqlite3.Connection) -> dict:
             "auto_context_level": get_setting_typed(conn, "ml_context_level"),
             "processing_mode": get_setting_typed(conn, "ml_processing_mode"),
             "ltm_enabled": get_setting_typed(conn, "ltm_enabled"),
-            "pro_enabled": get_setting_typed(conn, "pro_enabled"),
             "ltm_permissions": get_setting_typed(conn, "ltm_permissions"),
             "source_blocklist": sorted(get_blocklist(conn)),
         },
@@ -1269,132 +1107,6 @@ def set_embedder(conn: sqlite3.Connection, name: str) -> None:
     set_setting(conn, "embedder", kind)
 
 
-# ---------- License gate ----------
-def get_license_type(conn: sqlite3.Connection, override: Optional[str] = None) -> str:
-    if override:
-        val = override.strip().lower()
-    else:
-        val = get_setting(conn, "license_type", DEFAULT_LICENSE_TYPE).strip().lower()
-    return val if val in LICENSE_TIERS else DEFAULT_LICENSE_TYPE
-
-
-def set_license_type(conn: sqlite3.Connection, name: str) -> str:
-    kind = name.strip().lower()
-    if kind not in LICENSE_TIERS:
-        kind = DEFAULT_LICENSE_TYPE
-    set_setting(conn, "license_type", kind)
-    return kind
-
-
-def license_limits(conn: sqlite3.Connection, override: Optional[str] = None) -> dict:
-    lt = get_license_type(conn, override)
-    return {"license_type": lt, **LICENSE_TIERS[lt]}
-
-
-def device_identity() -> tuple[str, str]:
-    """Return a stable (device_id, hostname) for this machine."""
-    hostname = platform.node() or "unknown-host"
-    raw = f"{hostname}|{platform.platform()}|{os.environ.get('USER', '')}"
-    device_id = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return device_id, hostname
-
-
-def register_device(conn: sqlite3.Connection, max_devices: int) -> tuple[bool, int]:
-    """Register/refresh this device. Returns (allowed, total_device_count).
-
-    Already-known devices are always allowed (and refreshed). A new device is
-    only admitted while the registered count is below the tier's device cap.
-    """
-    device_id, hostname = device_identity()
-    now = datetime.now(timezone.utc).isoformat()
-    known = conn.execute(
-        "SELECT 1 FROM devices WHERE device_id = ?", (device_id,)
-    ).fetchone()
-    if known:
-        conn.execute(
-            "UPDATE devices SET last_seen = ?, hostname = ? WHERE device_id = ?",
-            (now, hostname, device_id),
-        )
-        conn.commit()
-        count = conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"]
-        return True, count
-    count = conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"]
-    if count >= max_devices:
-        return False, count
-    conn.execute(
-        "INSERT INTO devices(device_id, hostname, first_seen, last_seen) VALUES(?, ?, ?, ?)",
-        (device_id, hostname, now, now),
-    )
-    conn.commit()
-    return True, count + 1
-
-
-def enforce_license_gate(
-    conn: sqlite3.Connection,
-    persona: str,
-    *,
-    requested_cap: Optional[int] = None,
-    requested_embedder: Optional[str] = None,
-) -> dict:
-    """Resolve effective limits for an entry point and warn-upgrade past free caps.
-
-    Returns a dict with the resolved license type, the effective clip cap, the
-    effective embedder, whether this device is licensed, and the federation flag.
-    Emits human-facing warnings via ``say`` but never raises — capture/serve keep
-    working in a degraded (free-tier) mode.
-    """
-    info = license_limits(conn)
-    lt = info["license_type"]
-    max_clips = info["max_clips"]
-
-    # Device gate
-    device_allowed, device_count = register_device(conn, info["max_devices"])
-    if not device_allowed:
-        say(
-            persona,
-            f"[license:{lt}] device limit reached "
-            f"({device_count}/{info['max_devices']} active). This device is not "
-            f"licensed under the {lt} tier. Upgrade for more devices: {LICENSE_UPGRADE_URL}",
-        )
-
-    # Embedder gate: free is hash-only
-    effective_embedder = get_embedder(conn, requested_embedder)
-    if effective_embedder not in info["embedders"]:
-        say(
-            persona,
-            f"[license:{lt}] embedder '{effective_embedder}' requires pro; "
-            f"falling back to 'hash'. Upgrade: {LICENSE_UPGRADE_URL}",
-        )
-        effective_embedder = "hash"
-
-    # Clip cap gate: the license ceiling always wins (treat 0/None as "unlimited"
-    # request, still bounded by the tier cap).
-    if requested_cap and requested_cap > 0:
-        effective_cap = min(requested_cap, max_clips)
-    else:
-        effective_cap = max_clips
-
-    # Warn-upgrade if existing clip count already sits at/over the free ceiling.
-    total = conn.execute("SELECT COUNT(*) AS c FROM clips").fetchone()["c"]
-    if total >= max_clips:
-        say(
-            persona,
-            f"[license:{lt}] at clip cap ({total}/{max_clips}); oldest clips will be "
-            f"evicted. Upgrade for more capacity: {LICENSE_UPGRADE_URL}",
-        )
-
-    return {
-        "license_type": lt,
-        "effective_cap": effective_cap,
-        "effective_embedder": effective_embedder,
-        "device_allowed": device_allowed,
-        "device_count": device_count,
-        "max_devices": info["max_devices"],
-        "max_clips": max_clips,
-        "federation": info["federation"],
-    }
-
-
 def tokenize(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9_]+", text.lower())
 
@@ -1465,19 +1177,6 @@ def store_embedding(conn: sqlite3.Connection, clip_id: int, vec: list[float], mo
         (clip_id, len(vec), json.dumps(vec), model),
     )
     conn.commit()
-
-
-def index_embedding_if_enabled(
-    conn: sqlite3.Connection,
-    clip_id: int,
-    text: str,
-    embedder_override: Optional[str] = None,
-) -> bool:
-    if not get_pro_enabled(conn):
-        return False
-    vec, model = embed_text(conn, text, embedder_override)
-    store_embedding(conn, clip_id, vec, model)
-    return True
 
 
 def load_embedding(row) -> list[float]:
@@ -1888,18 +1587,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     notify_override: Optional[bool] = True if args.notify else False if args.no_notify else None
     notify_enabled = get_notify(conn, notify_override)
-    gate = enforce_license_gate(
-        conn,
-        MOTHER,
-        requested_cap=cap,
-        requested_embedder=getattr(args, "embedder", None),
-    )
-    cap = gate["effective_cap"]
-    embedder_choice = gate["effective_embedder"]
-    if not gate["device_allowed"]:
-        say(MOTHER, "device not licensed; not capturing. Free up a device slot or upgrade.")
-        return
-    say(MOTHER, f"license={gate['license_type']} cap={cap} embedder={embedder_choice}")
+    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
     cap_by_app = get_cap_map(conn, "cap_by_app")
     auto_summary_cmd = get_setting(conn, "auto_summary_cmd", "").strip()
     auto_tag_cmd = get_setting(conn, "auto_tag_cmd", "").strip()
@@ -2119,56 +1807,22 @@ def cmd_recent(args: argparse.Namespace) -> None:
 def cmd_search(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    clauses = ["clips_fts MATCH ?"]
+    params = [args.query]
+    if args.app:
+        clauses.append("LOWER(c.source_app) = LOWER(?)")
+        params.append(args.app)
+    if args.tag:
+        clauses.append(
+            "c.id IN (SELECT clip_id FROM clip_tags ct JOIN tags t ON t.id = ct.tag_id WHERE LOWER(t.name) = LOWER(?))"
+        )
+        params.append(args.tag)
+    if args.pins_only:
+        clauses.append("c.pinned = 1")
     since_iso = parse_iso_dt(args.since) if getattr(args, "since", None) else None
     if args.since_hours is not None:
         since_iso = iso_hours_ago(args.since_hours)
     until_iso = parse_iso_dt(args.until) if getattr(args, "until", None) else None
-    rows = fetch_fts_rows(
-        conn,
-        args.query,
-        args.limit,
-        app=args.app,
-        tag=args.tag,
-        since_iso=since_iso,
-        until_iso=until_iso,
-        pins_only=args.pins_only,
-    )
-    tag_map = tags_for_clips(conn, [row["id"] for row in rows])
-    for row in rows:
-        preview = row["content"].replace("\n", "\\n")
-        if len(preview) > 120:
-            preview = preview[:117] + "..."
-        pin_mark = "*" if row["pinned"] else " "
-        tags = tag_map.get(row["id"], [])
-        tags_str = f" tags={','.join(tags)}" if tags else ""
-        title = f" \"{row['title']}\"" if row["title"] else ""
-        lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
-        lang_str = f" lang={lang}" if lang else ""
-        say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
-
-
-def fetch_fts_rows(
-    conn: sqlite3.Connection,
-    query: str,
-    limit: int,
-    app: Optional[str] = None,
-    tag: Optional[str] = None,
-    since_iso: Optional[str] = None,
-    until_iso: Optional[str] = None,
-    pins_only: bool = False,
-) -> list[sqlite3.Row]:
-    clauses = ["clips_fts MATCH ?"]
-    params = [query]
-    if app:
-        clauses.append("LOWER(c.source_app) = LOWER(?)")
-        params.append(app)
-    if tag:
-        clauses.append(
-            "c.id IN (SELECT clip_id FROM clip_tags ct JOIN tags t ON t.id = ct.tag_id WHERE LOWER(t.name) = LOWER(?))"
-        )
-        params.append(tag)
-    if pins_only:
-        clauses.append("c.pinned = 1")
     if since_iso:
         clauses.append("datetime(c.created_at) >= datetime(?)")
         params.append(since_iso)
@@ -2184,9 +1838,21 @@ def fetch_fts_rows(
         ORDER BY c.created_at DESC
         LIMIT ?;
     """
-    params.append(limit)
+    params.append(args.limit)
     cur = conn.execute(sql, params)
-    return cur.fetchall()
+    rows = cur.fetchall()
+    tag_map = tags_for_clips(conn, [row["id"] for row in rows])
+    for row in rows:
+        preview = row["content"].replace("\n", "\\n")
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        pin_mark = "*" if row["pinned"] else " "
+        tags = tag_map.get(row["id"], [])
+        tags_str = f" tags={','.join(tags)}" if tags else ""
+        title = f" \"{row['title']}\"" if row["title"] else ""
+        lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
+        lang_str = f" lang={lang}" if lang else ""
+        say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
 
 
 def topic_groups(
@@ -2302,35 +1968,11 @@ def fetch_semantic_candidates(
 def cmd_semantic_search(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    qvec, model_used = embed_from_kind(get_embedder(conn, getattr(args, "embedder", None)), args.query)
     since_iso = parse_iso_dt(args.since) if getattr(args, "since", None) else None
     if getattr(args, "since_hours", None) is not None:
         since_iso = iso_hours_ago(args.since_hours)
     until_iso = parse_iso_dt(args.until) if getattr(args, "until", None) else None
-    if not get_pro_enabled(conn):
-        rows = fetch_fts_rows(
-            conn,
-            args.query,
-            args.limit,
-            app=args.app,
-            tag=args.tag,
-            since_iso=since_iso,
-            until_iso=until_iso,
-            pins_only=args.pins_only,
-        )
-        tag_map = tags_for_clips(conn, [row["id"] for row in rows])
-        for row in rows:
-            preview = row["content"].replace("\n", "\\n")
-            if len(preview) > 120:
-                preview = preview[:117] + "..."
-            pin_mark = "*" if row["pinned"] else " "
-            tags = tag_map.get(row["id"], [])
-            tags_str = f" tags={','.join(tags)}" if tags else ""
-            title = f" \"{row['title']}\"" if row["title"] else ""
-            lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
-            lang_str = f" lang={lang}" if lang else ""
-            say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
-        return
-    qvec, model_used = embed_from_kind(get_embedder(conn, getattr(args, "embedder", None)), args.query)
     rows = fetch_semantic_candidates(
         conn,
         args.app,
@@ -2391,7 +2033,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     latest = snap["latest"] or "n/a"
     say(
         FATHER,
-        f"capture={'paused' if snap['paused'] else 'active'}, license={snap['license_type']}, devices={snap['device_count']}, pro_enabled={snap['pro_enabled']}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
+        f"capture={'paused' if snap['paused'] else 'active'}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
         f"ltm={snap['ltm_enabled']}, ml_context={snap['ml_context_level']}, ml_mode={snap['ml_processing_mode']}, "
         f"max_bytes={snap['max_bytes']}, max_db_mb={snap['max_db_mb']}, evict_mode={snap['evict_mode']}, clips={snap['count']}, latest={latest}, db={snap['db_size_mb']:.2f} MB, blocklisted_apps={snap['blocklist_size']}, cap_by_app={snap['cap_by_app']}, cap_by_tag={snap['cap_by_tag']}",
     )
@@ -2871,8 +2513,6 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key == "notify":
             val = get_notify(conn, None)
             say(FATHER, f"notify={val}")
-        elif key == "pro_enabled":
-            say(FATHER, f"pro_enabled={get_pro_enabled(conn)}")
         elif key == "embedder":
             val = get_embedder(conn, None)
             say(FATHER, f"embedder={val}")
@@ -2899,11 +2539,6 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key in ("backup_passphrase", "backup_secret_key"):
             secret = get_setting(conn, key, "")
             say(FATHER, f"{key}={'***set***' if secret else ''}")
-        elif key in ("gumroad_permalink", "gumroad_license_key"):
-            say(FATHER, f"{key}={get_setting(conn, key, '')}")
-        elif key == "gumroad_webhook_secret":
-            secret = get_setting(conn, key, "")
-            say(FATHER, f"{key}={'***set***' if secret else ''}")
         elif key == "ai_recall_cmd":
             say(FATHER, f"ai_recall_cmd={get_setting(conn, 'ai_recall_cmd', '')}")
         elif key == "ai_fill_cmd":
@@ -2920,17 +2555,6 @@ def cmd_config(args: argparse.Namespace) -> None:
             say(FATHER, f"ml_processing_mode={get_setting(conn, 'ml_processing_mode', DEFAULT_ML_PROCESSING_MODE)}")
         elif key == "ltm_enabled":
             say(FATHER, f"ltm_enabled={get_bool_setting(conn, 'ltm_enabled', DEFAULT_LTM_ENABLED)}")
-        elif key == "license_type":
-            lt = get_license_type(conn, None)
-            limits = LICENSE_TIERS[lt]
-            say(
-                FATHER,
-                f"license_type={lt} (max_clips={limits['max_clips']}, "
-                f"max_devices={limits['max_devices']}, embedders={'/'.join(limits['embedders'])}, "
-                f"federation={limits['federation']})",
-            )
-        elif key == "federation_enabled":
-            say(FATHER, f"federation_enabled={get_bool_setting(conn, 'federation_enabled', False)}")
         else:
             say(FATHER, f"unknown key '{key}'")
         return
@@ -2968,13 +2592,6 @@ def cmd_config(args: argparse.Namespace) -> None:
                 say(FATHER, "set notify=False")
             else:
                 say(FATHER, "value must be true/false or 1/0")
-        elif key == "pro_enabled":
-            parsed = parse_bool_value(value)
-            if parsed is None:
-                say(FATHER, "value must be true/false or 1/0")
-            else:
-                set_pro_enabled(conn, parsed)
-                say(FATHER, f"set pro_enabled={parsed}")
         elif key == "embedder":
             set_embedder(conn, value)
             say(FATHER, f"set embedder={get_embedder(conn, None)}")
@@ -3035,12 +2652,6 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key in ("backup_passphrase", "backup_secret_key"):
             set_setting(conn, key, value)
             say(FATHER, f"set {key} (hidden)")
-        elif key in ("gumroad_permalink", "gumroad_license_key"):
-            set_setting(conn, key, value)
-            say(FATHER, f"set {key}={value}")
-        elif key == "gumroad_webhook_secret":
-            set_setting(conn, key, value)
-            say(FATHER, f"set {key} (hidden)")
         elif key == "ai_recall_cmd":
             set_setting(conn, "ai_recall_cmd", value)
             say(FATHER, "set ai_recall_cmd")
@@ -3075,21 +2686,6 @@ def cmd_config(args: argparse.Namespace) -> None:
             elif value.lower() in ("0", "false", "no", "off"):
                 set_bool_setting(conn, "ltm_enabled", False)
                 say(FATHER, "set ltm_enabled=False")
-            else:
-                say(FATHER, "value must be true/false or 1/0")
-        elif key == "license_type":
-            if value.strip().lower() in LICENSE_TIERS:
-                lt = set_license_type(conn, value)
-                say(FATHER, f"set license_type={lt}")
-            else:
-                say(FATHER, f"license_type must be one of: {', '.join(sorted(LICENSE_TIERS))}")
-        elif key == "federation_enabled":
-            if value.lower() in ("1", "true", "yes", "on"):
-                set_bool_setting(conn, "federation_enabled", True)
-                say(FATHER, "set federation_enabled=True")
-            elif value.lower() in ("0", "false", "no", "off"):
-                set_bool_setting(conn, "federation_enabled", False)
-                say(FATHER, "set federation_enabled=False")
             else:
                 say(FATHER, "value must be true/false or 1/0")
         else:
@@ -3849,9 +3445,6 @@ def cmd_federate_import(args: argparse.Namespace) -> None:
 def cmd_related(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not get_pro_enabled(conn):
-        say(FATHER, "semantic embeddings disabled; set pro_enabled=true to use related")
-        return
     cur = conn.execute(
         "SELECT vector, model FROM clip_vectors WHERE clip_id = ?",
         (args.id,),
@@ -3986,7 +3579,7 @@ def cmd_palette(args: argparse.Namespace) -> None:
     init_db(conn)
     rows: list[sqlite3.Row] = []
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
-    if args.semantic and args.query and get_pro_enabled(conn):
+    if args.semantic and args.query:
         embedder_kind = get_embedder(conn, getattr(args, "embedder", None))
         qvec, model_used = embed_from_kind(embedder_kind, args.query)
         rows_sem = fetch_semantic_candidates(conn, args.app, args.tag, args.limit * 5, model_used, since_iso=since_iso, pins_only=args.pins_only)
@@ -4112,29 +3705,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
-    def _read_raw_body(self) -> bytes:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except (TypeError, ValueError):
-            length = 0
-        if length <= 0:
-            return b""
-        return self.rfile.read(length)
-
-    @staticmethod
-    def _parse_body_fields(raw: bytes, content_type: str) -> dict:
-        """Parse a webhook body into a flat dict. Gumroad sends form-encoded
-        data; we also accept JSON as a convenience."""
-        ctype = (content_type or "").lower()
-        if "application/json" in ctype:
-            try:
-                data = json.loads(raw or b"{}")
-                return data if isinstance(data, dict) else {}
-            except json.JSONDecodeError:
-                return {}
-        parsed = urllib.parse.parse_qs(raw.decode("utf-8", errors="ignore"))
-        return {k: v[0] for k, v in parsed.items() if v}
-
     def log_message(self, format: str, *args) -> None:
         # Quiet by default
         return
@@ -4177,24 +3747,10 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     .status.warn { background: #302312; color: #ffc773; border: 1px solid #9b6b1a; }
     .note { background: #182035; border-radius: 4px; padding: 4px 6px; margin: 4px 0; font-size: 12px; color: #cdd7f3; }
     .note small { color: #8aa; }
-    .upgrade-banner { display: none; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; margin-bottom: 12px; border-radius: 6px; background: linear-gradient(90deg, #2a1a3e, #1a2540); border: 1px solid #6b3fa0; color: #f3e8ff; }
-    .upgrade-banner.show { display: flex; }
-    .upgrade-banner .upgrade-text { font-size: 13px; }
-    .upgrade-banner .upgrade-text strong { color: #ffd479; }
-    .upgrade-banner a.upgrade-cta { background: #ff6f91; color: #1a0b21; text-decoration: none; font-weight: 600; padding: 6px 14px; border-radius: 4px; white-space: nowrap; }
-    .upgrade-banner a.upgrade-cta:hover { background: #ff8fa8; }
-    .upgrade-banner .upgrade-dismiss { background: transparent; border: none; color: #cdb8e8; cursor: pointer; font-size: 16px; padding: 0 4px; }
   </style>
 </head>
 <body>
   <h1>my--father-mother</h1>
-  <div id="upgradeBanner" class="upgrade-banner">
-    <span class="upgrade-text">You're on the <strong>free tier</strong>. Upgrade to Pro for unlimited clips, semantic search, and cloud sync.</span>
-    <span>
-      <a id="upgradeLink" class="upgrade-cta" href="#" target="_blank" rel="noopener noreferrer">Upgrade to Pro</a>
-      <button class="upgrade-dismiss" title="Dismiss" onclick="dismissUpgrade()">&times;</button>
-    </span>
-  </div>
   <div id="status" class="status"></div>
   <div>
     <input id="q" placeholder="Search..." size="40"/>
@@ -4234,31 +3790,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         tagSel.appendChild(opt);
       });
     }
-    function renderUpgradeBanner(s) {
-      const banner = document.getElementById('upgradeBanner');
-      if (!banner) return;
-      const isFree = (s.license_type || 'free') === 'free';
-      const dismissed = sessionStorage.getItem('mfm_upgrade_dismissed') === '1';
-      if (isFree && !dismissed) {
-        const link = document.getElementById('upgradeLink');
-        if (link && s.upgrade_url) link.href = s.upgrade_url;
-        banner.classList.add('show');
-      } else {
-        banner.classList.remove('show');
-      }
-    }
-    function dismissUpgrade() {
-      sessionStorage.setItem('mfm_upgrade_dismissed', '1');
-      const banner = document.getElementById('upgradeBanner');
-      if (banner) banner.classList.remove('show');
-    }
     async function loadStatus() {
       const el = document.getElementById('status');
       try {
         const r = await fetch('/status');
         if (!r.ok) return;
         const s = await r.json();
-        renderUpgradeBanner(s);
         const paused = !!s.paused;
         const maxMb = s.max_db_mb || 0;
         const usedMb = s.db_size_mb || 0;
@@ -4616,16 +4153,36 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
             until_iso = parse_iso_dt(until_param) if until_param else None
-            rows_db = fetch_fts_rows(
-                conn,
-                q,
-                limit,
-                app=app,
-                tag=tag,
-                since_iso=since_iso,
-                until_iso=until_iso,
-                pins_only=pins_only,
-            )
+            clauses = ["clips_fts MATCH ?"]
+            params = [q]
+            if app:
+                clauses.append("LOWER(c.source_app) = LOWER(?)")
+                params.append(app)
+            if tag:
+                clauses.append(
+                    "c.id IN (SELECT clip_id FROM clip_tags ct JOIN tags t ON t.id = ct.tag_id WHERE LOWER(t.name) = LOWER(?))"
+                )
+                params.append(tag)
+            if pins_only:
+                clauses.append("c.pinned = 1")
+            if since_iso:
+                clauses.append("datetime(c.created_at) >= datetime(?)")
+                params.append(since_iso)
+            if until_iso:
+                clauses.append("datetime(c.created_at) <= datetime(?)")
+                params.append(until_iso)
+            where = " AND ".join(clauses)
+            sql = f"""
+                SELECT c.id, c.created_at, c.source_app, c.window_title, c.content, c.pinned, c.title, c.lang
+                FROM clips_fts f
+                JOIN clips c ON c.id = f.rowid
+                WHERE {where}
+                ORDER BY c.created_at DESC
+                LIMIT ?;
+            """
+            params.append(limit)
+            cur = conn.execute(sql, params)
+            rows_db = cur.fetchall()
             tag_map = tags_for_clips(conn, [row["id"] for row in rows_db])
             notes_map = notes_for_clips(conn, [row["id"] for row in rows_db])
             rows = []
@@ -4663,7 +4220,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     "allow_secrets": get_allow_secrets(conn, None),
                     "notify": get_notify(conn, None),
                     "max_db_mb": get_max_db_mb(conn, None),
-                    "pro_enabled": get_pro_enabled(conn),
                     "embedder": get_embedder(conn, None),
                     "cap_by_app": get_cap_map(conn, "cap_by_app"),
                     "cap_by_tag": get_cap_map(conn, "cap_by_tag"),
@@ -4767,6 +4323,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
             pool = int(qs.get("pool", [2000])[0])
+            embedder_kind = get_embedder(conn, qs.get("embedder", [None])[0])
+            qvec, model_used = embed_from_kind(embedder_kind, q)
             pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
             since_param = qs.get("since", [None])[0]
             until_param = qs.get("until", [None])[0]
@@ -4778,39 +4336,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
             until_iso = parse_iso_dt(until_param) if until_param else None
-            if not get_pro_enabled(conn):
-                rows_db = fetch_fts_rows(
-                    conn,
-                    q,
-                    limit,
-                    app=app,
-                    tag=tag,
-                    since_iso=since_iso,
-                    until_iso=until_iso,
-                    pins_only=pins_only,
-                )
-                tag_map = tags_for_clips(conn, [row["id"] for row in rows_db])
-                notes_map = notes_for_clips(conn, [row["id"] for row in rows_db])
-                rows = []
-                for row in rows_db:
-                    rows.append(
-                        dict(
-                            id=row["id"],
-                            created_at=row["created_at"],
-                            source_app=row["source_app"],
-                            window_title=row["window_title"],
-                            content=row["content"],
-                            pinned=bool(row["pinned"]),
-                            title=row["title"],
-                            lang=row["lang"],
-                            tags=tag_map.get(row["id"], []),
-                            notes=notes_map.get(row["id"], []),
-                        )
-                    )
-                self._send(200, {"items": rows})
-                return
-            embedder_kind = get_embedder(conn, qs.get("embedder", [None])[0])
-            qvec, model_used = embed_from_kind(embedder_kind, q)
             rows = fetch_semantic_candidates(conn, app, tag, pool, model_used, since_iso=since_iso, until_iso=until_iso, pins_only=pins_only)
             ids, vecs = build_ann_index(rows)
             sims = knn(qvec, ids, vecs, limit)
@@ -4845,28 +4370,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         path = self.path
         conn = self.conn
         init_db(conn)
-        if path == "/webhooks/gumroad":
-            raw = self._read_raw_body()
-            secret = gumroad_webhook_secret(conn)
-            if not secret:
-                self._send(503, {"error": "gumroad webhook secret not configured"})
-                return
-            signature = self.headers.get(GUMROAD_SIG_HEADER, "")
-            if not verify_gumroad_signature(secret, raw, signature):
-                self._send(401, {"error": "invalid signature"})
-                return
-            fields = self._parse_body_fields(raw, self.headers.get("Content-Type", ""))
-            license_key = store_gumroad_license(conn, fields)
-            if not license_key:
-                self._send(400, {"error": "missing license_key"})
-                return
-            # Re-validate the freshly-stored key (best-effort, never fatal).
-            try:
-                status = validate_license(conn)
-            except Exception:
-                status = {"valid": get_bool_setting(conn, "license_valid", False)}
-            self._send(200, {"ok": True, "stored": True, "license_valid": bool(status.get("valid"))})
-            return
         if path == "/pin":
             data = self._parse_json()
             try:
@@ -4931,13 +4434,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     return
                 set_setting(conn, "max_db_mb", str(intval))
                 updated["max_db_mb"] = intval
-            if "pro_enabled" in data:
-                parsed = parse_bool_value(str(data["pro_enabled"]))
-                if parsed is None:
-                    self._send(400, {"error": "invalid pro_enabled"})
-                    return
-                set_pro_enabled(conn, parsed)
-                updated["pro_enabled"] = parsed
             if "embedder" in data:
                 set_embedder(conn, str(data["embedder"]))
                 updated["embedder"] = get_embedder(conn, None)
@@ -4979,11 +4475,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             if "ai_fill_cmd" in data:
                 set_setting(conn, "ai_fill_cmd", str(data["ai_fill_cmd"]))
                 updated["ai_fill_cmd"] = get_setting(conn, "ai_fill_cmd", "")
-            for gr_key in ("gumroad_webhook_secret", "gumroad_permalink", "gumroad_license_key"):
-                if gr_key in data:
-                    set_setting(conn, gr_key, str(data[gr_key]))
-                    # Never echo the secret back in the response.
-                    updated[gr_key] = "***" if gr_key == "gumroad_webhook_secret" else get_setting(conn, gr_key, "")
             if updated:
                 self._send(200, {"ok": True, **updated})
             else:
@@ -5251,25 +4742,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
 def cmd_serve(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    validate_license(conn)
-
-    gate = enforce_license_gate(conn, FATHER)
-    if not gate["device_allowed"]:
-        say(FATHER, "device not licensed; refusing to serve. Free up a device slot or upgrade.")
-        return
-    federation_requested = get_bool_setting(conn, "federation_enabled", False)
-    if federation_requested and not gate["federation"]:
-        say(
-            FATHER,
-            f"[license:{gate['license_type']}] federation is a pro feature; serving "
-            f"in local-only mode. Upgrade: {LICENSE_UPGRADE_URL}",
-        )
-    federation_active = federation_requested and gate["federation"]
-    say(
-        FATHER,
-        f"license={gate['license_type']} devices={gate['device_count']}/{gate['max_devices']} "
-        f"federation={'on' if federation_active else 'off'}",
-    )
 
     def handler(*h_args, **h_kwargs):
         return ApiHandler(*h_args, conn=conn, **h_kwargs)
@@ -5451,8 +4923,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="get/set config (max_bytes)")
     group_cfg = p_config.add_mutually_exclusive_group(required=True)
-    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, pro_enabled, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
-    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, pro_enabled, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
+    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
     p_config.set_defaults(func=cmd_config)
 
     p_purge = sub.add_parser("purge", help="purge clips by age/app/keep-last/all")
@@ -5657,10 +5129,6 @@ def main(argv: list[str]) -> int:
     args.func(args)
     return 0
 
-
-
-def cli() -> int:
-    return main(sys.argv[1:])
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

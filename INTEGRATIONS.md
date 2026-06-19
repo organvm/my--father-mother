@@ -3,9 +3,6 @@ Integrations Cookbook
 
 This is a grab-bag of ways to wire my--father-mother into common tools listed on the Pieces integrations page. All methods use the local CLI or HTTP API (`serve` on `127.0.0.1:8765`).
 
-For the full customer API reference, including authentication/security notes,
-schemas, errors, and webhook signing, see `docs/API.md`.
-
 General API endpoints
 - Recent/filters: `GET /recent?limit=30&app=Terminal&tag=project&pins_only=true`
 - Search: `GET /search?q=auth%20token&limit=20`

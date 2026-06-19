@@ -93,26 +93,11 @@ class TestInsertClip:
         assert id2 is None
 
     def test_stores_embedding(self, conn):
-        mfm.set_pro_enabled(conn, True)
         cid = mfm.insert_clip(conn, "embedding test", "App", "Win")
         vec_row = conn.execute("SELECT * FROM clip_vectors WHERE clip_id = ?", (cid,)).fetchone()
         assert vec_row is not None
         assert vec_row["model"] == "hash"
         assert vec_row["dim"] == mfm.EMBED_DIM
-
-    def test_without_pro_skips_embedding_and_keeps_fts(self, conn):
-        cid = mfm.insert_clip(conn, "fts fallback content", "App", "Win")
-        assert cid is not None
-
-        vec_row = conn.execute("SELECT * FROM clip_vectors WHERE clip_id = ?", (cid,)).fetchone()
-        assert vec_row is None
-
-        fts_row = conn.execute(
-            "SELECT rowid FROM clips_fts WHERE clips_fts MATCH ?",
-            ("fallback",),
-        ).fetchone()
-        assert fts_row is not None
-        assert fts_row["rowid"] == cid
 
 
 class TestInsertEvent:
@@ -556,17 +541,6 @@ class TestNotify:
     def test_set_and_get(self, conn):
         mfm.set_notify(conn, True)
         assert mfm.get_notify(conn, None) is True
-
-
-class TestProEnabled:
-    def test_default_off(self, conn):
-        assert mfm.get_pro_enabled(conn) is False
-
-    def test_set_and_get(self, conn):
-        mfm.set_pro_enabled(conn, True)
-        assert mfm.get_pro_enabled(conn) is True
-        mfm.set_pro_enabled(conn, False)
-        assert mfm.get_pro_enabled(conn) is False
 
 
 class TestEmbedder:
