@@ -49,6 +49,8 @@ DEFAULT_UI_CONFIRMATIONS = "default"
 DEFAULT_UI_METRICS = "default"
 DEFAULT_UI_TOOLBAR = "suggested"
 DEFAULT_PERSONAL_CLOUD_STATUS = "disconnected"
+DEFAULT_LICENSE_TYPE = "free"  # free|pro
+GUMROAD_UPGRADE_URL = "https://gumroad.com/l/my-father-mother-pro"
 
 DEFAULT_MAX_BYTES = 16_384  # ~16 KB
 DEFAULT_NOTIFY = False
@@ -681,6 +683,7 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "sync_interval": get_sync_interval(conn),
         "license_type": get_license_type(conn, None),
         "device_count": conn.execute("SELECT COUNT(*) AS c FROM devices").fetchone()["c"],
+        "upgrade_url": get_setting(conn, "account_upgrade_url", "") or GUMROAD_UPGRADE_URL,
     }
 
 
@@ -898,6 +901,7 @@ SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "account_linked": ("json", []),
     "account_orgs": ("json", []),
     "account_upgrade_url": ("str", ""),
+    "license_type": ("str", DEFAULT_LICENSE_TYPE),
     "personal_cloud_status": ("str", DEFAULT_PERSONAL_CLOUD_STATUS),
     "personal_cloud_domain": ("str", ""),
     "personal_cloud_last_updated": ("str", ""),
@@ -4092,10 +4096,24 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     .status.warn { background: #302312; color: #ffc773; border: 1px solid #9b6b1a; }
     .note { background: #182035; border-radius: 4px; padding: 4px 6px; margin: 4px 0; font-size: 12px; color: #cdd7f3; }
     .note small { color: #8aa; }
+    .upgrade-banner { display: none; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; margin-bottom: 12px; border-radius: 6px; background: linear-gradient(90deg, #2a1a3e, #1a2540); border: 1px solid #6b3fa0; color: #f3e8ff; }
+    .upgrade-banner.show { display: flex; }
+    .upgrade-banner .upgrade-text { font-size: 13px; }
+    .upgrade-banner .upgrade-text strong { color: #ffd479; }
+    .upgrade-banner a.upgrade-cta { background: #ff6f91; color: #1a0b21; text-decoration: none; font-weight: 600; padding: 6px 14px; border-radius: 4px; white-space: nowrap; }
+    .upgrade-banner a.upgrade-cta:hover { background: #ff8fa8; }
+    .upgrade-banner .upgrade-dismiss { background: transparent; border: none; color: #cdb8e8; cursor: pointer; font-size: 16px; padding: 0 4px; }
   </style>
 </head>
 <body>
   <h1>my--father-mother</h1>
+  <div id="upgradeBanner" class="upgrade-banner">
+    <span class="upgrade-text">You're on the <strong>free tier</strong>. Upgrade to Pro for unlimited clips, semantic search, and cloud sync.</span>
+    <span>
+      <a id="upgradeLink" class="upgrade-cta" href="#" target="_blank" rel="noopener noreferrer">Upgrade to Pro</a>
+      <button class="upgrade-dismiss" title="Dismiss" onclick="dismissUpgrade()">&times;</button>
+    </span>
+  </div>
   <div id="status" class="status"></div>
   <div>
     <input id="q" placeholder="Search..." size="40"/>
@@ -4135,12 +4153,31 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         tagSel.appendChild(opt);
       });
     }
+    function renderUpgradeBanner(s) {
+      const banner = document.getElementById('upgradeBanner');
+      if (!banner) return;
+      const isFree = (s.license_type || 'free') === 'free';
+      const dismissed = sessionStorage.getItem('mfm_upgrade_dismissed') === '1';
+      if (isFree && !dismissed) {
+        const link = document.getElementById('upgradeLink');
+        if (link && s.upgrade_url) link.href = s.upgrade_url;
+        banner.classList.add('show');
+      } else {
+        banner.classList.remove('show');
+      }
+    }
+    function dismissUpgrade() {
+      sessionStorage.setItem('mfm_upgrade_dismissed', '1');
+      const banner = document.getElementById('upgradeBanner');
+      if (banner) banner.classList.remove('show');
+    }
     async function loadStatus() {
       const el = document.getElementById('status');
       try {
         const r = await fetch('/status');
         if (!r.ok) return;
         const s = await r.json();
+        renderUpgradeBanner(s);
         const paused = !!s.paused;
         const maxMb = s.max_db_mb || 0;
         const usedMb = s.db_size_mb || 0;
