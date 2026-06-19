@@ -63,9 +63,9 @@ The core thesis is straightforward: **if you copied it, you cared about it, and 
 
 ### Single-File Runtime
 
-The entire application lives in `main.py` — approximately 4,900 lines of Python 3.10+ using only the standard library for its core functionality. This is a deliberate architectural choice. A single-file CLI tool has zero dependency friction: you clone the repo, run `python3 main.py init`, and you are operational. No virtual environments, no package resolution, no build step.
+The entire application lives in `main.py` — approximately 5,400 lines of Python 3.10+ using only the standard library for its core functionality. This is a deliberate architectural choice. A single-file CLI tool has zero dependency friction: you clone the repo, run `python3 main.py init`, and you are operational. No virtual environments, no package resolution, no build step.
 
-Optional dependencies (`sentence-transformers`, `langdetect`) unlock enhanced semantic search and language detection but are never required for core operation.
+Optional dependencies (`sentence-transformers`, `langdetect`, `cryptography`) unlock enhanced semantic search, language detection, and encrypted-at-rest storage but are never required for core operation.
 
 ### Storage Layer
 
@@ -74,7 +74,7 @@ Optional dependencies (`sentence-transformers`, `langdetect`) unlock enhanced se
   mfm.db          # SQLite database (WAL mode)
 ```
 
-The database uses SQLite in WAL (Write-Ahead Logging) mode for concurrent read/write access. The schema includes:
+The database uses SQLite in WAL (Write-Ahead Logging) mode for concurrent read/write access. If initialized with `python3 main.py init --encrypt`, `mfm.db` is stored as an AES-256-GCM encrypted blob and the random 256-bit key is stored in macOS Keychain. The schema includes:
 
 | Table | Purpose |
 |-------|---------|
@@ -146,6 +146,9 @@ cd my--father-mother
 # Initialize the database
 python3 main.py init
 # => creates ~/.my-father-mother/mfm.db
+
+# Optional: initialize or migrate mfm.db with AES-256-GCM at-rest encryption
+python3 main.py init --encrypt
 
 # Start the clipboard watcher (Mother)
 python3 main.py watch --cap 5000
@@ -306,7 +309,7 @@ The CLI is organized by persona. Every command is assigned to either Mother (cap
 
 | Command | Description |
 |---------|-------------|
-| `init` | Create the database at `~/.my-father-mother/mfm.db` |
+| `init` | Create the database at `~/.my-father-mother/mfm.db` (`--encrypt` stores it encrypted with a Keychain-held key) |
 | `watch` | Start the clipboard capture loop (`--cap`, `--interval`, `--notify`) |
 | `pause` | Pause, resume, or toggle capture (`--on`, `--off`, `--toggle`) |
 | `ingest-file` | Ingest a single file into the store |
@@ -561,7 +564,9 @@ my--father-mother takes a defense-in-depth approach to clipboard security:
 
 5. **Database caps with backpressure.** The `max_db_mb` setting (default 512 MB) enforces a hard cap on database size. When approached, the system warns via `/status` and evicts according to the configured eviction mode.
 
-6. **No network listeners by default.** The HTTP API (`serve`) and MCP bridge (`mcp_server.py`) only start when explicitly invoked and bind to `127.0.0.1` (localhost only).
+6. **Optional encryption at rest.** Run `init --encrypt` to store `mfm.db` as AES-256-GCM encrypted bytes. The database key is generated locally and stored in macOS Keychain.
+
+7. **No network listeners by default.** The HTTP API (`serve`) and MCP bridge (`mcp_server.py`) only start when explicitly invoked and bind to `127.0.0.1` (localhost only).
 
 ---
 
@@ -598,10 +603,10 @@ The tool demonstrates ORGAN-III's product philosophy: build useful, opinionated 
 - PDF and OCR image ingestion (opt-in)
 - Markdown journal export
 - AI helper hooks (recall/fill, opt-in)
+- Data encryption at rest for `mfm.db` via AES-256-GCM and macOS Keychain
 
 ### Planned
 
-- **Data encryption at rest** — encrypt the SQLite database for additional security on shared machines
 - **Full browser extension** — richer than the current sample; persistent sidebar, highlight capture, page annotation
 - **Menubar mini-UI** — native SwiftUI or Electron app beyond the current SwiftBar stub
 - **Cloud sync targets** — S3-compatible and iCloud Drive with encryption, explicit opt-in only

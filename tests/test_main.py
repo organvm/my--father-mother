@@ -8,6 +8,21 @@ from datetime import datetime, timezone, timedelta
 import main as mfm
 
 
+FIXED_ENCRYPTION_KEY = b"0" * 32
+
+
+def point_db_at_tmp(monkeypatch, tmp_path):
+    db_dir = tmp_path / "mfm-home"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(mfm, "DB_DIR", db_dir)
+    monkeypatch.setattr(mfm, "DB_PATH", db_dir / "mfm.db")
+    return db_dir / "mfm.db"
+
+
+def stub_keychain_key(monkeypatch, key=FIXED_ENCRYPTION_KEY):
+    monkeypatch.setattr(mfm, "get_db_encryption_key", lambda create=False: key)
+
+
 # ──────────────────────────────────────────────
 # Database + Schema
 # ──────────────────────────────────────────────
@@ -42,6 +57,115 @@ class TestInitDb:
         assert "title" in cols
         assert "file_path" in cols
         assert "lang" in cols
+
+    def test_parser_accepts_encrypt_flag(self):
+        args = mfm.build_parser().parse_args(["init", "--encrypt"])
+        assert args.encrypt is True
+        assert args.func is mfm.cmd_init
+
+
+class TestEncryptedDb:
+    def test_encrypt_db_bytes_round_trips(self):
+        payload = b"SQLite format 3\x00example"
+        encrypted = mfm.encrypt_db_bytes(payload, FIXED_ENCRYPTION_KEY)
+        assert encrypted.startswith(mfm.ENCRYPTED_DB_MAGIC)
+        assert payload not in encrypted
+        assert mfm.decrypt_db_bytes(encrypted, FIXED_ENCRYPTION_KEY) == payload
+
+    def test_connect_db_encrypts_existing_plain_db(self, tmp_path, monkeypatch):
+        db_path = point_db_at_tmp(monkeypatch, tmp_path)
+        stub_keychain_key(monkeypatch)
+
+        plain = sqlite3.connect(db_path)
+        plain.row_factory = sqlite3.Row
+        mfm.init_db(plain)
+        clip_id = mfm.insert_clip(plain, "secret memory", "App", "Win")
+        plain.close()
+        assert db_path.read_bytes().startswith(b"SQLite format 3")
+
+        conn = mfm.connect_db(encrypt=True)
+        try:
+            assert mfm.connection_is_encrypted(conn) is True
+            row = conn.execute("SELECT content FROM clips WHERE id = ?", (clip_id,)).fetchone()
+            assert row["content"] == "secret memory"
+        finally:
+            conn.close()
+
+        encrypted = db_path.read_bytes()
+        assert encrypted.startswith(mfm.ENCRYPTED_DB_MAGIC)
+        assert not encrypted.startswith(b"SQLite format 3")
+        assert b"secret memory" not in encrypted
+
+        reopened = mfm.connect_db()
+        try:
+            row = reopened.execute("SELECT content FROM clips WHERE id = ?", (clip_id,)).fetchone()
+            assert row["content"] == "secret memory"
+        finally:
+            reopened.close()
+
+    def test_encrypted_connection_persists_commits_and_snapshots(self, tmp_path, monkeypatch):
+        db_path = point_db_at_tmp(monkeypatch, tmp_path)
+        stub_keychain_key(monkeypatch)
+
+        conn = mfm.connect_db(encrypt=True)
+        try:
+            mfm.init_db(conn)
+            clip_id = mfm.insert_clip(conn, "persistent secret", "App", "Win")
+        finally:
+            conn.close()
+
+        encrypted = db_path.read_bytes()
+        assert encrypted.startswith(mfm.ENCRYPTED_DB_MAGIC)
+        assert b"persistent secret" not in encrypted
+
+        reopened = mfm.connect_db()
+        try:
+            row = reopened.execute("SELECT content FROM clips WHERE id = ?", (clip_id,)).fetchone()
+            assert row["content"] == "persistent secret"
+        finally:
+            reopened.close()
+
+        snapshot = tmp_path / "snapshot.db"
+        mfm.write_db_snapshot(snapshot)
+        snap = sqlite3.connect(snapshot)
+        snap.row_factory = sqlite3.Row
+        try:
+            row = snap.execute("SELECT content FROM clips WHERE id = ?", (clip_id,)).fetchone()
+            assert row["content"] == "persistent secret"
+        finally:
+            snap.close()
+
+    def test_sync_pull_restores_encrypted_backup_when_reencrypt_fails(self, tmp_path, monkeypatch):
+        db_path = point_db_at_tmp(monkeypatch, tmp_path)
+        stub_keychain_key(monkeypatch)
+
+        conn = mfm.connect_db(encrypt=True)
+        try:
+            mfm.init_db(conn)
+            mfm.insert_clip(conn, "keep encrypted", "App", "Win")
+        finally:
+            conn.close()
+        encrypted_before = db_path.read_bytes()
+
+        source = tmp_path / "plain-source.db"
+        plain = sqlite3.connect(source)
+        plain.row_factory = sqlite3.Row
+        try:
+            mfm.init_db(plain)
+            mfm.insert_clip(plain, "pulled plaintext", "App", "Win")
+        finally:
+            plain.close()
+
+        def fail_keychain(create=False):
+            raise RuntimeError("missing key")
+
+        monkeypatch.setattr(mfm, "get_db_encryption_key", fail_keychain)
+        ok, msg = mfm.sync_pull(str(source))
+
+        assert ok is False
+        assert "re-encrypt failed" in msg
+        assert db_path.read_bytes() == encrypted_before
+        assert db_path.read_bytes().startswith(mfm.ENCRYPTED_DB_MAGIC)
 
 
 class TestColumnExists:
