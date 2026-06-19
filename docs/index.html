@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>my--father-mother — Local-only clipboard memory for macOS</title>
+<meta name="description" content="A local-only clipboard memory for macOS. Everything you copy becomes searchable — by keyword, by meaning, by recency. No cloud, no account, no telemetry. Pro adds semantic embeddings and summarization for $3.99/mo.">
+<meta property="og:title" content="my--father-mother — Local-only clipboard memory for macOS">
+<meta property="og:description" content="Your clipboard is a river of context that vanishes the moment you copy again. This remembers — searchable by keyword, by meaning, by recency. 100% local.">
+<meta property="og:type" content="website">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0f1e;
+  --bg-alt:#0d1328;
+  --bg-card:rgba(255,255,255,.04);
+  --border:rgba(59,130,246,.18);
+  --border-strong:rgba(59,130,246,.4);
+  --accent:#3b82f6;
+  --accent-2:#60a5fa;
+  --moon:#a78bfa;
+  --sun:#f59e0b;
+  --text:#e5e7eb;
+  --muted:#94a3b8;
+  --dim:#6b7280;
+  --good:#34d399;
+  --font:-apple-system,'Segoe UI','Helvetica Neue',sans-serif;
+  --mono:'SF Mono','Fira Code','Consolas',monospace;
+}
+html{scroll-behavior:smooth;font-size:16px}
+body{font-family:var(--font);color:var(--text);background:var(--bg);line-height:1.65;overflow-x:hidden}
+a{color:inherit}
+h1,h2,h3{font-weight:700;line-height:1.15;letter-spacing:-.02em}
+h1{font-size:clamp(2.4rem,6vw,4.2rem)}
+h2{font-size:clamp(1.7rem,3.4vw,2.6rem)}
+h3{font-size:1.1rem}
+.wrap{width:100%;max-width:1080px;margin:0 auto;padding:0 1.5rem}
+.label{font-family:var(--mono);font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--accent);margin-bottom:.75rem}
+.mono{font-family:var(--mono)}
+section{padding:5.5rem 0;border-top:1px solid rgba(255,255,255,.04)}
+.lead{font-size:1.08rem;color:var(--muted);max-width:62ch}
+
+/* ===== NAV ===== */
+header{position:sticky;top:0;z-index:50;backdrop-filter:blur(10px);background:rgba(10,15,30,.72);border-bottom:1px solid rgba(255,255,255,.05)}
+header .wrap{display:flex;align-items:center;justify-content:space-between;padding-top:.85rem;padding-bottom:.85rem}
+.brand{font-family:var(--mono);font-size:.95rem;font-weight:600;letter-spacing:-.01em;display:flex;align-items:center;gap:.55rem}
+.brand .glyph{font-size:1.05rem}
+nav.links{display:flex;gap:1.6rem;align-items:center}
+nav.links a{font-size:.85rem;color:var(--muted);text-decoration:none;transition:color .2s}
+nav.links a:hover{color:var(--text)}
+.btn{display:inline-block;padding:.7rem 1.4rem;border-radius:9px;font-family:var(--mono);font-size:.82rem;font-weight:600;text-decoration:none;transition:all .2s;border:1.5px solid var(--accent);cursor:pointer}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:transparent;color:var(--accent-2);border-color:var(--accent-2)}
+.btn-ghost{background:transparent;color:var(--text);border-color:var(--border-strong)}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent-2)}
+@media(max-width:640px){nav.links a.navlink{display:none}}
+
+/* ===== HERO ===== */
+#hero{padding-top:5rem;padding-bottom:5.5rem;text-align:center;position:relative;overflow:hidden;border-top:none}
+#hero-canvas{position:absolute;inset:0;z-index:0;opacity:.55}
+#hero .wrap{position:relative;z-index:1}
+.badge{display:inline-flex;align-items:center;gap:.5rem;font-family:var(--mono);font-size:.7rem;letter-spacing:.13em;text-transform:uppercase;padding:.4rem 1rem;border:1px solid var(--border-strong);border-radius:30px;color:var(--accent-2);margin-bottom:1.8rem}
+.badge .dot{width:7px;height:7px;border-radius:50%;background:var(--good);box-shadow:0 0 8px var(--good)}
+#hero h1{margin-bottom:1.1rem;max-width:16ch;margin-left:auto;margin-right:auto}
+#hero h1 .grad{background:linear-gradient(100deg,var(--accent-2),var(--moon));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+#hero .tagline{font-size:clamp(1.05rem,2vw,1.3rem);color:var(--muted);max-width:60ch;margin:0 auto 2.4rem}
+.hero-cta{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;margin-bottom:1.4rem}
+.hero-note{font-family:var(--mono);font-size:.74rem;color:var(--dim);letter-spacing:.03em}
+.hero-note b{color:var(--good);font-weight:600}
+
+/* ===== STRIP ===== */
+.strip{display:flex;gap:2.5rem;justify-content:center;flex-wrap:wrap;margin-top:3.2rem;padding-top:2.4rem;border-top:1px solid rgba(255,255,255,.06)}
+.stat{text-align:center}
+.stat .n{font-family:var(--mono);font-size:1.5rem;font-weight:700;color:var(--text)}
+.stat .l{font-size:.78rem;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
+
+/* ===== PERSONA ===== */
+.persona-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-top:2.5rem}
+.persona{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:1.8rem}
+.persona .role{font-family:var(--mono);font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;margin-bottom:.7rem}
+.persona.moon .role{color:var(--moon)}
+.persona.sun .role{color:var(--sun)}
+.persona h3{margin-bottom:.5rem;font-size:1.25rem}
+.persona p{color:var(--muted);font-size:.92rem}
+@media(max-width:640px){.persona-grid{grid-template-columns:1fr}}
+
+/* ===== FEATURES ===== */
+.feature-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:1.3rem;margin-top:2.5rem}
+.feature{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;transition:border-color .25s,transform .25s}
+.feature:hover{border-color:var(--border-strong);transform:translateY(-3px)}
+.feature .ico{font-size:1.4rem;margin-bottom:.7rem;display:block}
+.feature h3{font-size:1rem;margin-bottom:.4rem;color:var(--text)}
+.feature p{color:var(--muted);font-size:.88rem}
+
+/* ===== TERMINAL ===== */
+.term{margin-top:2.5rem;background:#070b16;border:1px solid var(--border);border-radius:12px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.term-bar{display:flex;align-items:center;gap:.5rem;padding:.7rem 1rem;background:rgba(255,255,255,.03);border-bottom:1px solid rgba(255,255,255,.05)}
+.term-bar .d{width:11px;height:11px;border-radius:50%}
+.term-bar .d.r{background:#ff5f56}.term-bar .d.y{background:#ffbd2e}.term-bar .d.g{background:#27c93f}
+.term-bar .t{margin-left:.6rem;font-family:var(--mono);font-size:.72rem;color:var(--dim)}
+.term pre{margin:0;padding:1.4rem 1.3rem;font-family:var(--mono);font-size:.82rem;line-height:1.75;overflow-x:auto;color:var(--text)}
+.term .c{color:var(--dim)}
+.term .p{color:var(--accent-2)}
+.term .o{color:var(--muted)}
+.term .h{color:var(--good)}
+
+/* ===== PRICING ===== */
+.price-grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-top:2.8rem;max-width:760px;margin-left:auto;margin-right:auto}
+.plan{background:var(--bg-card);border:1px solid var(--border);border-radius:16px;padding:2rem 1.8rem;position:relative;display:flex;flex-direction:column}
+.plan.pro{border-color:var(--border-strong);background:linear-gradient(180deg,rgba(59,130,246,.08),var(--bg-card))}
+.plan .tier{font-family:var(--mono);font-size:.78rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:.4rem}
+.plan.pro .tier{color:var(--accent-2)}
+.plan .ribbon{position:absolute;top:1.4rem;right:1.4rem;font-family:var(--mono);font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;padding:.25rem .6rem;border-radius:20px;background:var(--accent);color:#fff}
+.plan .price{font-size:2.6rem;font-weight:700;letter-spacing:-.03em;margin:.3rem 0 .1rem}
+.plan .price small{font-size:.95rem;font-weight:400;color:var(--dim)}
+.plan .sub{font-size:.85rem;color:var(--dim);margin-bottom:1.4rem}
+.plan ul{list-style:none;margin:0 0 1.8rem;flex:1}
+.plan li{font-size:.9rem;color:var(--muted);padding:.45rem 0 .45rem 1.6rem;position:relative}
+.plan li::before{content:"✓";position:absolute;left:0;color:var(--good);font-weight:700}
+.plan li.muted::before{content:"–";color:var(--dim)}
+.plan li.muted{color:var(--dim)}
+.plan .btn{text-align:center;width:100%}
+@media(max-width:640px){.price-grid{grid-template-columns:1fr}}
+.price-foot{text-align:center;margin-top:1.8rem;font-size:.85rem;color:var(--dim)}
+.price-foot a{color:var(--accent-2);text-decoration:none}
+.price-foot a:hover{text-decoration:underline}
+
+/* ===== PRIVACY ===== */
+#privacy{background:var(--bg-alt)}
+.privacy-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:1.2rem;margin-top:2.4rem}
+.priv{padding:1.4rem;border-left:2px solid var(--accent);background:var(--bg-card);border-radius:0 10px 10px 0}
+.priv h3{font-size:.95rem;color:var(--text);margin-bottom:.35rem}
+.priv p{font-size:.86rem;color:var(--muted)}
+
+/* ===== FINAL CTA ===== */
+#final{text-align:center;background:radial-gradient(ellipse at center,rgba(59,130,246,.08),transparent 70%)}
+#final h2{margin-bottom:1rem}
+#final p{color:var(--muted);max-width:52ch;margin:0 auto 2rem}
+.final-cta{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap}
+
+/* ===== FOOTER ===== */
+footer{padding:3rem 0 2.5rem;border-top:1px solid rgba(255,255,255,.06);color:var(--dim);font-size:.82rem}
+footer .wrap{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem}
+footer a{color:var(--muted);text-decoration:none}
+footer a:hover{color:var(--text)}
+footer .flinks{display:flex;gap:1.4rem}
+
+@media(prefers-reduced-motion:reduce){
+  *{animation-duration:0s!important;transition-duration:0s!important}
+  html{scroll-behavior:auto}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <span class="brand"><span class="glyph">☾ ☉</span> my--father-mother</span>
+    <nav class="links">
+      <a class="navlink" href="#features">Features</a>
+      <a class="navlink" href="#pricing">Pricing</a>
+      <a class="navlink" href="https://github.com/organvm-iii-ergon/my--father-mother" target="_blank" rel="noopener">GitHub</a>
+      <a class="btn btn-primary" href="#pricing">Get it</a>
+    </nav>
+  </div>
+</header>
+
+<!-- HERO -->
+<section id="hero">
+  <canvas id="hero-canvas" aria-hidden="true"></canvas>
+  <div class="wrap">
+    <span class="badge"><span class="dot"></span> 100% local · no cloud · no account</span>
+    <h1>Your clipboard has a <span class="grad">memory</span> now.</h1>
+    <p class="tagline">Everything you copy — code, links, notes, half-formed ideas — usually vanishes the moment you copy the next thing. <b>my--father-mother</b> remembers it all, on your Mac, and gives it back by keyword, by meaning, or by recency.</p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="#pricing">Download &amp; buy</a>
+      <a class="btn btn-ghost" href="https://github.com/organvm-iii-ergon/my--father-mother" target="_blank" rel="noopener">View source</a>
+    </div>
+    <p class="hero-note"><b>Free &amp; open-source core.</b> &nbsp;Pro adds semantic search + summarization for $3.99/mo.</p>
+
+    <div class="strip">
+      <div class="stat"><div class="n">0</div><div class="l">bytes to cloud</div></div>
+      <div class="stat"><div class="n">SQLite</div><div class="l">FTS5 + vectors</div></div>
+      <div class="stat"><div class="n">1-file</div><div class="l">Python, stdlib</div></div>
+      <div class="stat"><div class="n">MCP</div><div class="l">AI-native</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- PROBLEM / SOLUTION -->
+<section id="why">
+  <div class="wrap">
+    <p class="label">Why it exists</p>
+    <h2>Clipboard managers remember the last few copies.<br>This remembers everything you ever cared about.</h2>
+    <p class="lead" style="margin-top:1.2rem">If you copied it, you cared about it — and you might need it again. Most clipboard tools optimize for <em>recent recall</em>: a scrollable list of your last N copies. They can't answer "that auth thing I pasted last Tuesday." This turns your clipboard into a durable, searchable, programmable knowledge layer that lives entirely on your machine.</p>
+
+    <div class="persona-grid">
+      <div class="persona moon">
+        <div class="role">☾ Mother · Moon</div>
+        <h3>The Watcher</h3>
+        <p>Runs the capture loop. Records every snippet with its timestamp, frontmost app, and window title. Deduplicates, prunes to your cap, ingests files — ever-listening, ever-recording.</p>
+      </div>
+      <div class="persona sun">
+        <div class="role">☉ Father · Sun</div>
+        <h3>The Retriever</h3>
+        <p>Runs search, recent, export, and stats. Queried on demand, always ready with answers — by keyword, by meaning, or by recency. The active, solar half of the system.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section id="features">
+  <div class="wrap">
+    <p class="label">Capabilities</p>
+    <h2>Built to find what you copied.</h2>
+    <div class="feature-grid">
+      <div class="feature"><span class="ico">🔎</span><h3>Full-text search</h3><p>SQLite FTS5 over every clip you've ever captured. Instant keyword matches across months of history.</p></div>
+      <div class="feature"><span class="ico">🧠</span><h3>Semantic search</h3><p>Find by meaning, not just words. "OAuth credential rotation" matches "auth token refresh" even with zero overlapping words. <span class="mono" style="color:var(--accent-2)">Pro</span></p></div>
+      <div class="feature"><span class="ico">🔒</span><h3>Local-only by design</h3><p>Everything lives in <span class="mono">~/.my-father-mother/mfm.db</span>. No cloud, no telemetry, no account. Ever.</p></div>
+      <div class="feature"><span class="ico">🛡️</span><h3>Secret-aware</h3><p>Detects and skips AWS keys, GitHub PATs, private keys, and Slack tokens before they're ever stored.</p></div>
+      <div class="feature"><span class="ico">🏷️</span><h3>Tags &amp; pins</h3><p>Annotate, tag, and pin the clips that matter so they survive eviction and stay one query away.</p></div>
+      <div class="feature"><span class="ico">📝</span><h3>Auto-summarization</h3><p>Long clips get a one-line summary so your history stays scannable at a glance. <span class="mono" style="color:var(--accent-2)">Pro</span></p></div>
+      <div class="feature"><span class="ico">🔌</span><h3>MCP bridge</h3><p>Expose your clipboard memory to AI coding tools over the Model Context Protocol. API-first, scriptable.</p></div>
+      <div class="feature"><span class="ico">⚡</span><h3>Zero dependencies</h3><p>One Python file, stdlib only. Clone, <span class="mono">init</span>, and you're running. No build step, no venv juggling.</p></div>
+    </div>
+
+    <div class="term">
+      <div class="term-bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="t">zsh — my--father-mother</span></div>
+<pre><span class="c"># Mother starts watching your clipboard</span>
+<span class="p">$</span> python3 main.py watch --cap 5000
+
+<span class="c"># Father finds it again — by keyword</span>
+<span class="p">$</span> python3 main.py search <span class="o">"docker env"</span>
+
+<span class="c"># ...or by meaning (Pro)</span>
+<span class="p">$</span> python3 main.py semantic-search <span class="o">"api authentication"</span>
+<span class="h">→ matched "OAuth token refresh flow" copied 6 days ago</span></pre>
+    </div>
+  </div>
+</section>
+
+<!-- PRICING -->
+<section id="pricing">
+  <div class="wrap">
+    <p class="label" style="text-align:center">Pricing</p>
+    <h2 style="text-align:center">Simple. Local. Honest.</h2>
+    <p class="lead" style="text-align:center;margin:1.2rem auto 0">The core is free and open-source forever. Pro unlocks the heavy, meaning-aware features — and even those run entirely on your machine.</p>
+
+    <div class="price-grid">
+      <div class="plan">
+        <div class="tier">Free</div>
+        <div class="price">$0</div>
+        <div class="sub">Open-source · MIT · forever</div>
+        <ul>
+          <li>Unlimited clipboard capture</li>
+          <li>Full-text (FTS5) search</li>
+          <li>Tags, pins &amp; notes</li>
+          <li>Secret detection &amp; blocklist</li>
+          <li>HTTP API + MCP bridge</li>
+          <li>Hash-based similarity search</li>
+          <li class="muted">Semantic embeddings</li>
+          <li class="muted">Auto-summarization</li>
+        </ul>
+        <a class="btn btn-ghost" href="https://github.com/organvm-iii-ergon/my--father-mother" target="_blank" rel="noopener">Clone on GitHub</a>
+      </div>
+
+      <div class="plan pro">
+        <span class="ribbon">Pro</span>
+        <div class="tier">Pro</div>
+        <div class="price">$3.99<small> / mo</small></div>
+        <div class="sub">Everything in Free, plus meaning</div>
+        <ul>
+          <li>Everything in Free</li>
+          <li><b>Semantic search</b> (e5 embeddings)</li>
+          <li>Find clips by meaning, not keywords</li>
+          <li><b>Auto-summarization</b> of long clips</li>
+          <li>Smart auto-tagging hooks</li>
+          <li>Priority support</li>
+          <li>Still 100% local — models run on-device</li>
+        </ul>
+        <a class="btn btn-primary" href="#" data-buy="pro">Get Pro — $3.99/mo</a>
+      </div>
+    </div>
+    <p class="price-foot">Cancel anytime. No account required for Free. &nbsp;·&nbsp; Full breakdown in <a href="PRICING.md">docs/PRICING.md</a></p>
+  </div>
+</section>
+
+<!-- PRIVACY -->
+<section id="privacy">
+  <div class="wrap">
+    <p class="label">The promise</p>
+    <h2>Your clipboard never leaves your Mac.</h2>
+    <div class="privacy-grid">
+      <div class="priv"><h3>No cloud</h3><p>Nothing is uploaded — not on Free, not on Pro. Pro's semantic models run on-device.</p></div>
+      <div class="priv"><h3>No account</h3><p>The Free core needs no sign-up. Clone it and run. No email, no profile.</p></div>
+      <div class="priv"><h3>No telemetry</h3><p>Zero analytics, zero phone-home. The code is one readable Python file you can audit yourself.</p></div>
+      <div class="priv"><h3>You own the data</h3><p>One portable SQLite file. Export it, back it up, or delete it — it's yours.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- FINAL CTA -->
+<section id="final">
+  <div class="wrap">
+    <h2>Stop losing what you copy.</h2>
+    <p>Start free in under a minute. Upgrade to Pro when you want search that understands what you meant.</p>
+    <div class="final-cta">
+      <a class="btn btn-primary" href="#pricing">Download &amp; buy</a>
+      <a class="btn btn-ghost" href="https://github.com/organvm-iii-ergon/my--father-mother" target="_blank" rel="noopener">Read the docs</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>☾ ☉ my--father-mother · Local-only clipboard memory for macOS</span>
+    <span class="flinks">
+      <a href="https://github.com/organvm-iii-ergon/my--father-mother" target="_blank" rel="noopener">GitHub</a>
+      <a href="PRICING.md">Pricing</a>
+      <a href="https://github.com/organvm-iii-ergon" target="_blank" rel="noopener">ORGAN-III · Ergon</a>
+    </span>
+  </div>
+</footer>
+
+<script>
+/* hero waveform — the clipboard "river" */
+(function(){
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var canvas=document.getElementById('hero-canvas');
+  if(!canvas) return;
+  var ctx=canvas.getContext('2d'), dpr=window.devicePixelRatio||1;
+  function resize(){canvas.width=canvas.offsetWidth*dpr;canvas.height=canvas.offsetHeight*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);}
+  resize();window.addEventListener('resize',resize);
+  var W=function(){return canvas.offsetWidth;},H=function(){return canvas.offsetHeight;};
+  var t=0;
+  function draw(){
+    ctx.clearRect(0,0,W(),H());t+=0.004;
+    for(var line=0;line<3;line++){
+      ctx.beginPath();
+      var amp=18+line*10, yBase=H()*0.5+(line-1)*26;
+      for(var x=0;x<=W();x+=6){
+        var y=yBase+Math.sin(x*0.012+t+line*1.3)*amp*Math.sin(t*0.6+line);
+        x===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+      }
+      ctx.strokeStyle='rgba(59,130,246,'+(0.12-line*0.03)+')';
+      ctx.lineWidth=1.5;ctx.stroke();
+    }
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+/* buy CTA placeholder — wire to a real checkout (Stripe/Gumroad/Paddle) */
+(function(){
+  document.querySelectorAll('[data-buy]').forEach(function(el){
+    el.addEventListener('click',function(e){
+      e.preventDefault();
+      alert('Checkout coming soon — Pro is $3.99/mo.\n\nMeanwhile, the free open-source core is on GitHub.');
+    });
+  });
+})();
+</script>
+</body>
+</html>
