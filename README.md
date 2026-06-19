@@ -91,19 +91,18 @@ The database uses SQLite in WAL (Write-Ahead Logging) mode for concurrent read/w
 
 ### Embedding System
 
-Embedding indexing is gated by the local `pro_enabled` flag. When it is off, new clips still land in SQLite and FTS5; vector computation and storage are skipped. When it is on, two embedding modes are available, switchable at runtime via `config --set embedder`:
+Two embedding modes are available, switchable at runtime via `config --set embedder`:
 
-**Hash embeddings (default when Pro is enabled):** Fast, zero-dependency 128-dimensional vectors generated from character n-gram hashing. These provide reasonable similarity matching for exact and near-exact content without requiring any model downloads.
+**Hash embeddings (default):** Fast, zero-dependency 128-dimensional vectors generated from character n-gram hashing. These provide reasonable similarity matching for exact and near-exact content without requiring any model downloads. This is the default because it works instantly with no setup.
 
 **E5-small embeddings (opt-in):** Semantic embeddings using the `intfloat/e5-small-v2` model from the `sentence-transformers` library. These provide genuine meaning-based similarity — "authentication token refresh" will match "OAuth credential rotation" even when no keywords overlap. Enable with:
 
 ```bash
-python3 main.py config --set pro_enabled true
 pip install sentence-transformers langdetect
 python3 main.py config --set embedder e5-small
 ```
 
-Existing clips retain their stored vectors when you switch modes. New clips are embedded using whichever mode is active only while `pro_enabled` is true. Both modes produce 128-dimensional vectors stored in the `clip_vectors` table, so the search interface is identical regardless of backend.
+Existing clips retain their stored vectors when you switch modes. New clips are embedded using whichever mode is active. Both modes produce 128-dimensional vectors stored in the `clip_vectors` table, so the search interface is identical regardless of backend.
 
 ### Capture Pipeline
 
@@ -115,14 +114,14 @@ The Mother watcher loop follows this pipeline on each tick (default: 1-second in
 4. **Secret detection** — skip clips matching common secret patterns (AWS keys, GitHub PATs, private keys, Slack tokens) unless `allow_secrets` is enabled
 5. **Blocklist check** — skip if the frontmost app is in the blocklist
 6. **Metadata extraction** — capture frontmost app name and window title via `osascript`
-7. **Persistence** — insert into `clips` table, update FTS5 index, and generate/store an embedding vector only when `pro_enabled` is true
+7. **Persistence** — insert into `clips` table, update FTS5 index, generate and store embedding vector
 8. **Smart hooks** — optionally run user-provided `auto_summary_cmd` and `auto_tag_cmd` shell commands
 9. **Cap enforcement** — if clip count exceeds cap, evict oldest (FIFO) or oldest non-pinned (tiered) clips
 10. **Notification** — optionally fire a macOS toast via `osascript` displaying the saved clip
 
 ### HTTP Server
 
-The `serve` command starts a local HTTP server (default port 8765) that exposes the full retrieval API plus a minimal web UI at the root path. The server tries up to 3 consecutive ports if the requested port is busy. Endpoints mirror CLI commands, including retrieval (`/recent`, `/search`, `/semantic_search`, `/context`, `/clip`), management (`/status`, `/config`, `/pin`, `/tags`, `/notes`), ingest (`/dropper`, `/ingest_url`), and federation (`/federate_export`, `/federate_import`). See [docs/API.md](docs/API.md) for the full customer reference.
+The `serve` command starts a local HTTP server (default port 8765) that exposes the full retrieval API plus a minimal web UI at the root path. The server tries up to 3 consecutive ports if the requested port is busy. Endpoints mirror CLI commands: `/recent`, `/search`, `/semantic_search`, `/context`, `/clip`, `/status`, `/pin`, `/tags`, `/dropper`, `/ingest_url`, `/recap`, `/topics`, `/federate_export`, `/federate_import`.
 
 ### MCP Bridge
 
@@ -151,10 +150,6 @@ python3 main.py init
 # Start the clipboard watcher (Mother)
 python3 main.py watch --cap 5000
 # => [mother|moon] watching clipboard (cap=5000, interval=1.0s)
-
-# Start the local HTTP API and web UI (Father)
-python3 main.py serve --port 8765
-# => [father|sun] serving API on http://127.0.0.1:8765
 
 # In another terminal, query your clips (Father)
 python3 main.py recent --limit 10
@@ -376,38 +371,22 @@ Navigate to `http://127.0.0.1:8765/` for a minimal but functional web UI with se
 
 ### API Endpoints
 
-For complete request/response schemas, authentication details, and customer
-integration examples, see [docs/API.md](docs/API.md).
-
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Health check |
-| GET | `/stats` | Clip count and database size |
-| GET | `/recent` | Recent clips (params: `limit`, `app`, `tag`, `pins_only`, `since`, `until`, `hours`) |
-| GET | `/search` | FTS5 keyword search (params: `q`, `limit`, `app`, `tag`, `pins_only`, `since`, `until`, `hours`) |
-| GET | `/semantic_search` | Semantic search (params: `q`, `limit`, `pool`, `embedder`, filters) |
+| GET | `/recent` | Recent clips (params: `limit`, `app`, `tag`, `pins_only`, `since`, `until`) |
+| GET | `/search` | FTS5 keyword search (params: `q`, `limit`, `app`, `tag`) |
+| GET | `/semantic_search` | Semantic search (params: `q`, `limit`) |
 | GET | `/context` | Context bundle for LLM sidecars (params: `limit`, `app`, `tag`, `hours`, `pins_only`) |
 | GET | `/clip` | Single clip by ID (params: `id`) |
 | GET | `/status` | Runtime status (paused, notify, DB size, caps) |
-| GET | `/settings` | Customer settings snapshot |
-| GET | `/config` | Runtime configuration subset |
-| POST | `/config` | Update runtime configuration |
 | GET | `/recap` | Recent activity summary (params: `minutes`) |
-| GET | `/topics` | Topic buckets (params: `limit`, `per_group`, `hours`, filters) |
+| GET | `/topics` | Topic buckets (params: `limit`, `per_group`, `since_hours`) |
 | GET | `/tags` | List all tags |
-| GET | `/blocklist` | List blocked capture apps |
-| POST | `/blocklist` | Add a blocked capture app |
-| DELETE | `/blocklist` | Remove a blocked capture app |
 | POST | `/pin` | Pin/unpin a clip (`{"id": N, "pinned": true}`) |
-| POST | `/notes` | Add a note to a clip (`{"id": N, "note": "..."}`) |
-| POST | `/pause` | Pause clipboard capture |
-| POST | `/resume` | Resume clipboard capture |
 | POST | `/dropper` | Browser extension ingest (`{"url", "title", "selection", "html", "app"}`) |
 | POST | `/ingest_url` | Bookmarklet ingest (`{"url", "title", "selection"}`) |
 | GET | `/federate_export` | Export clips as JSON for federation |
 | POST | `/federate_import` | Import clips from a peer |
-| POST | `/purge` | Delete clips by policy |
-| POST | `/webhooks/gumroad` | Signed Gumroad license webhook |
 
 ---
 
@@ -554,7 +533,6 @@ python3 main.py config --set max_bytes 32768  # write a value
 | `max_db_mb` | `512` | Database size cap in MB |
 | `allow_secrets` | `false` | Store clips matching secret patterns |
 | `notify` | `false` | macOS toast notifications on save/skip |
-| `pro_enabled` | `false` | Enable semantic embedding indexing for new clips |
 | `embedder` | `hash` | Embedding backend: `hash` or `e5-small` |
 | `evict_mode` | `fifo` | Eviction strategy: `fifo` or `tiered` (prefer non-pinned) |
 | `cap_by_app` | `{}` | JSON dict of per-app clip caps |
