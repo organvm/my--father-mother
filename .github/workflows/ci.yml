@@ -34,5 +34,15 @@ jobs:
             echo "::warning::No license file found"
           fi
 
+
+      - name: Smoke test API
+        run: |
+          python3 main.py init
+          python3 main.py serve &
+          SERVER_PID=$!
+          sleep 3
+          curl -s --fail http://127.0.0.1:8765/status || (kill $SERVER_PID && false)
+          kill $SERVER_PID
+
       - name: Success
         run: echo "::notice::Minimal CI validation passed"
