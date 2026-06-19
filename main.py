@@ -76,6 +76,7 @@ LICENSE_TIERS: dict[str, dict] = {
         "federation": True,
     },
 }
+DEFAULT_PRO_ENABLED = False
 E5_MODEL_NAME = "intfloat/e5-small-v2"
 EMBED_DIM = 128
 DEFAULT_EVICT_MODE = "fifo"  # fifo|tiered
@@ -405,8 +406,7 @@ def insert_clip(
     )
     conn.commit()
     clip_id = cur.lastrowid
-    vec, model = embed_text(conn, clean, embedder_override)
-    store_embedding(conn, clip_id, vec, model)
+    index_embedding_if_enabled(conn, clip_id, clean, embedder_override)
     return clip_id
 
 
@@ -441,8 +441,7 @@ def insert_clip_import(
     )
     conn.commit()
     clip_id = cur.lastrowid
-    vec, model = embed_text(conn, clean, None)
-    store_embedding(conn, clip_id, vec, model)
+    index_embedding_if_enabled(conn, clip_id, clean, None)
     if tags:
         for t in tags:
             assign_tag(conn, clip_id, t)
@@ -666,6 +665,7 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "paused": is_paused(conn),
         "allow_secrets": get_allow_secrets(conn, None),
         "notify": get_notify(conn, None),
+        "pro_enabled": get_pro_enabled(conn),
         "embedder": get_embedder(conn, None),
         "max_bytes": get_max_bytes(conn, None),
         "max_db_mb": get_max_db_mb(conn, None),
@@ -863,6 +863,14 @@ def validate_license(conn: sqlite3.Connection, online: bool = True) -> dict:
     return {"valid": cached, "reason": "cached"}
 
 
+def get_pro_enabled(conn: sqlite3.Connection) -> bool:
+    return get_bool_setting(conn, "pro_enabled", DEFAULT_PRO_ENABLED)
+
+
+def set_pro_enabled(conn: sqlite3.Connection, enabled: bool) -> None:
+    set_bool_setting(conn, "pro_enabled", enabled)
+
+
 def get_sync_interval(conn: sqlite3.Connection) -> float:
     raw = get_setting(conn, "sync_interval", str(DEFAULT_WATCH_SYNC_INTERVAL)).strip()
     try:
@@ -911,6 +919,7 @@ SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "ml_context_level": ("str", DEFAULT_ML_CONTEXT_LEVEL),
     "ml_processing_mode": ("str", DEFAULT_ML_PROCESSING_MODE),
     "ltm_enabled": ("bool", DEFAULT_LTM_ENABLED),
+    "pro_enabled": ("bool", DEFAULT_PRO_ENABLED),
     "ltm_permissions": ("str", "unknown"),
     "ui_default_view": ("str", DEFAULT_UI_VIEW),
     "ui_confirmations": ("str", DEFAULT_UI_CONFIRMATIONS),
@@ -1018,6 +1027,7 @@ def settings_snapshot(conn: sqlite3.Connection) -> dict:
             "auto_context_level": get_setting_typed(conn, "ml_context_level"),
             "processing_mode": get_setting_typed(conn, "ml_processing_mode"),
             "ltm_enabled": get_setting_typed(conn, "ltm_enabled"),
+            "pro_enabled": get_setting_typed(conn, "pro_enabled"),
             "ltm_permissions": get_setting_typed(conn, "ltm_permissions"),
             "source_blocklist": sorted(get_blocklist(conn)),
         },
@@ -1455,6 +1465,19 @@ def store_embedding(conn: sqlite3.Connection, clip_id: int, vec: list[float], mo
         (clip_id, len(vec), json.dumps(vec), model),
     )
     conn.commit()
+
+
+def index_embedding_if_enabled(
+    conn: sqlite3.Connection,
+    clip_id: int,
+    text: str,
+    embedder_override: Optional[str] = None,
+) -> bool:
+    if not get_pro_enabled(conn):
+        return False
+    vec, model = embed_text(conn, text, embedder_override)
+    store_embedding(conn, clip_id, vec, model)
+    return True
 
 
 def load_embedding(row) -> list[float]:
@@ -2096,22 +2119,56 @@ def cmd_recent(args: argparse.Namespace) -> None:
 def cmd_search(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    clauses = ["clips_fts MATCH ?"]
-    params = [args.query]
-    if args.app:
-        clauses.append("LOWER(c.source_app) = LOWER(?)")
-        params.append(args.app)
-    if args.tag:
-        clauses.append(
-            "c.id IN (SELECT clip_id FROM clip_tags ct JOIN tags t ON t.id = ct.tag_id WHERE LOWER(t.name) = LOWER(?))"
-        )
-        params.append(args.tag)
-    if args.pins_only:
-        clauses.append("c.pinned = 1")
     since_iso = parse_iso_dt(args.since) if getattr(args, "since", None) else None
     if args.since_hours is not None:
         since_iso = iso_hours_ago(args.since_hours)
     until_iso = parse_iso_dt(args.until) if getattr(args, "until", None) else None
+    rows = fetch_fts_rows(
+        conn,
+        args.query,
+        args.limit,
+        app=args.app,
+        tag=args.tag,
+        since_iso=since_iso,
+        until_iso=until_iso,
+        pins_only=args.pins_only,
+    )
+    tag_map = tags_for_clips(conn, [row["id"] for row in rows])
+    for row in rows:
+        preview = row["content"].replace("\n", "\\n")
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        pin_mark = "*" if row["pinned"] else " "
+        tags = tag_map.get(row["id"], [])
+        tags_str = f" tags={','.join(tags)}" if tags else ""
+        title = f" \"{row['title']}\"" if row["title"] else ""
+        lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
+        lang_str = f" lang={lang}" if lang else ""
+        say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
+
+
+def fetch_fts_rows(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int,
+    app: Optional[str] = None,
+    tag: Optional[str] = None,
+    since_iso: Optional[str] = None,
+    until_iso: Optional[str] = None,
+    pins_only: bool = False,
+) -> list[sqlite3.Row]:
+    clauses = ["clips_fts MATCH ?"]
+    params = [query]
+    if app:
+        clauses.append("LOWER(c.source_app) = LOWER(?)")
+        params.append(app)
+    if tag:
+        clauses.append(
+            "c.id IN (SELECT clip_id FROM clip_tags ct JOIN tags t ON t.id = ct.tag_id WHERE LOWER(t.name) = LOWER(?))"
+        )
+        params.append(tag)
+    if pins_only:
+        clauses.append("c.pinned = 1")
     if since_iso:
         clauses.append("datetime(c.created_at) >= datetime(?)")
         params.append(since_iso)
@@ -2127,21 +2184,9 @@ def cmd_search(args: argparse.Namespace) -> None:
         ORDER BY c.created_at DESC
         LIMIT ?;
     """
-    params.append(args.limit)
+    params.append(limit)
     cur = conn.execute(sql, params)
-    rows = cur.fetchall()
-    tag_map = tags_for_clips(conn, [row["id"] for row in rows])
-    for row in rows:
-        preview = row["content"].replace("\n", "\\n")
-        if len(preview) > 120:
-            preview = preview[:117] + "..."
-        pin_mark = "*" if row["pinned"] else " "
-        tags = tag_map.get(row["id"], [])
-        tags_str = f" tags={','.join(tags)}" if tags else ""
-        title = f" \"{row['title']}\"" if row["title"] else ""
-        lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
-        lang_str = f" lang={lang}" if lang else ""
-        say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
+    return cur.fetchall()
 
 
 def topic_groups(
@@ -2257,11 +2302,35 @@ def fetch_semantic_candidates(
 def cmd_semantic_search(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    qvec, model_used = embed_from_kind(get_embedder(conn, getattr(args, "embedder", None)), args.query)
     since_iso = parse_iso_dt(args.since) if getattr(args, "since", None) else None
     if getattr(args, "since_hours", None) is not None:
         since_iso = iso_hours_ago(args.since_hours)
     until_iso = parse_iso_dt(args.until) if getattr(args, "until", None) else None
+    if not get_pro_enabled(conn):
+        rows = fetch_fts_rows(
+            conn,
+            args.query,
+            args.limit,
+            app=args.app,
+            tag=args.tag,
+            since_iso=since_iso,
+            until_iso=until_iso,
+            pins_only=args.pins_only,
+        )
+        tag_map = tags_for_clips(conn, [row["id"] for row in rows])
+        for row in rows:
+            preview = row["content"].replace("\n", "\\n")
+            if len(preview) > 120:
+                preview = preview[:117] + "..."
+            pin_mark = "*" if row["pinned"] else " "
+            tags = tag_map.get(row["id"], [])
+            tags_str = f" tags={','.join(tags)}" if tags else ""
+            title = f" \"{row['title']}\"" if row["title"] else ""
+            lang = row["lang"] if row["lang"] not in (None, "", "unk") else ""
+            lang_str = f" lang={lang}" if lang else ""
+            say(FATHER, f"{pin_mark}#{row['id']:>5} {row['created_at']} [{row['source_app']}] {preview}{title}{tags_str}{lang_str}")
+        return
+    qvec, model_used = embed_from_kind(get_embedder(conn, getattr(args, "embedder", None)), args.query)
     rows = fetch_semantic_candidates(
         conn,
         args.app,
@@ -2322,7 +2391,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     latest = snap["latest"] or "n/a"
     say(
         FATHER,
-        f"capture={'paused' if snap['paused'] else 'active'}, license={snap['license_type']}, devices={snap['device_count']}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
+        f"capture={'paused' if snap['paused'] else 'active'}, license={snap['license_type']}, devices={snap['device_count']}, pro_enabled={snap['pro_enabled']}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
         f"ltm={snap['ltm_enabled']}, ml_context={snap['ml_context_level']}, ml_mode={snap['ml_processing_mode']}, "
         f"max_bytes={snap['max_bytes']}, max_db_mb={snap['max_db_mb']}, evict_mode={snap['evict_mode']}, clips={snap['count']}, latest={latest}, db={snap['db_size_mb']:.2f} MB, blocklisted_apps={snap['blocklist_size']}, cap_by_app={snap['cap_by_app']}, cap_by_tag={snap['cap_by_tag']}",
     )
@@ -2802,6 +2871,8 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key == "notify":
             val = get_notify(conn, None)
             say(FATHER, f"notify={val}")
+        elif key == "pro_enabled":
+            say(FATHER, f"pro_enabled={get_pro_enabled(conn)}")
         elif key == "embedder":
             val = get_embedder(conn, None)
             say(FATHER, f"embedder={val}")
@@ -2897,6 +2968,13 @@ def cmd_config(args: argparse.Namespace) -> None:
                 say(FATHER, "set notify=False")
             else:
                 say(FATHER, "value must be true/false or 1/0")
+        elif key == "pro_enabled":
+            parsed = parse_bool_value(value)
+            if parsed is None:
+                say(FATHER, "value must be true/false or 1/0")
+            else:
+                set_pro_enabled(conn, parsed)
+                say(FATHER, f"set pro_enabled={parsed}")
         elif key == "embedder":
             set_embedder(conn, value)
             say(FATHER, f"set embedder={get_embedder(conn, None)}")
@@ -3771,6 +3849,9 @@ def cmd_federate_import(args: argparse.Namespace) -> None:
 def cmd_related(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not get_pro_enabled(conn):
+        say(FATHER, "semantic embeddings disabled; set pro_enabled=true to use related")
+        return
     cur = conn.execute(
         "SELECT vector, model FROM clip_vectors WHERE clip_id = ?",
         (args.id,),
@@ -3905,7 +3986,7 @@ def cmd_palette(args: argparse.Namespace) -> None:
     init_db(conn)
     rows: list[sqlite3.Row] = []
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
-    if args.semantic and args.query:
+    if args.semantic and args.query and get_pro_enabled(conn):
         embedder_kind = get_embedder(conn, getattr(args, "embedder", None))
         qvec, model_used = embed_from_kind(embedder_kind, args.query)
         rows_sem = fetch_semantic_candidates(conn, args.app, args.tag, args.limit * 5, model_used, since_iso=since_iso, pins_only=args.pins_only)
@@ -4535,36 +4616,16 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
             until_iso = parse_iso_dt(until_param) if until_param else None
-            clauses = ["clips_fts MATCH ?"]
-            params = [q]
-            if app:
-                clauses.append("LOWER(c.source_app) = LOWER(?)")
-                params.append(app)
-            if tag:
-                clauses.append(
-                    "c.id IN (SELECT clip_id FROM clip_tags ct JOIN tags t ON t.id = ct.tag_id WHERE LOWER(t.name) = LOWER(?))"
-                )
-                params.append(tag)
-            if pins_only:
-                clauses.append("c.pinned = 1")
-            if since_iso:
-                clauses.append("datetime(c.created_at) >= datetime(?)")
-                params.append(since_iso)
-            if until_iso:
-                clauses.append("datetime(c.created_at) <= datetime(?)")
-                params.append(until_iso)
-            where = " AND ".join(clauses)
-            sql = f"""
-                SELECT c.id, c.created_at, c.source_app, c.window_title, c.content, c.pinned, c.title, c.lang
-                FROM clips_fts f
-                JOIN clips c ON c.id = f.rowid
-                WHERE {where}
-                ORDER BY c.created_at DESC
-                LIMIT ?;
-            """
-            params.append(limit)
-            cur = conn.execute(sql, params)
-            rows_db = cur.fetchall()
+            rows_db = fetch_fts_rows(
+                conn,
+                q,
+                limit,
+                app=app,
+                tag=tag,
+                since_iso=since_iso,
+                until_iso=until_iso,
+                pins_only=pins_only,
+            )
             tag_map = tags_for_clips(conn, [row["id"] for row in rows_db])
             notes_map = notes_for_clips(conn, [row["id"] for row in rows_db])
             rows = []
@@ -4602,6 +4663,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     "allow_secrets": get_allow_secrets(conn, None),
                     "notify": get_notify(conn, None),
                     "max_db_mb": get_max_db_mb(conn, None),
+                    "pro_enabled": get_pro_enabled(conn),
                     "embedder": get_embedder(conn, None),
                     "cap_by_app": get_cap_map(conn, "cap_by_app"),
                     "cap_by_tag": get_cap_map(conn, "cap_by_tag"),
@@ -4705,8 +4767,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
             pool = int(qs.get("pool", [2000])[0])
-            embedder_kind = get_embedder(conn, qs.get("embedder", [None])[0])
-            qvec, model_used = embed_from_kind(embedder_kind, q)
             pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
             since_param = qs.get("since", [None])[0]
             until_param = qs.get("until", [None])[0]
@@ -4718,6 +4778,39 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     pass
             until_iso = parse_iso_dt(until_param) if until_param else None
+            if not get_pro_enabled(conn):
+                rows_db = fetch_fts_rows(
+                    conn,
+                    q,
+                    limit,
+                    app=app,
+                    tag=tag,
+                    since_iso=since_iso,
+                    until_iso=until_iso,
+                    pins_only=pins_only,
+                )
+                tag_map = tags_for_clips(conn, [row["id"] for row in rows_db])
+                notes_map = notes_for_clips(conn, [row["id"] for row in rows_db])
+                rows = []
+                for row in rows_db:
+                    rows.append(
+                        dict(
+                            id=row["id"],
+                            created_at=row["created_at"],
+                            source_app=row["source_app"],
+                            window_title=row["window_title"],
+                            content=row["content"],
+                            pinned=bool(row["pinned"]),
+                            title=row["title"],
+                            lang=row["lang"],
+                            tags=tag_map.get(row["id"], []),
+                            notes=notes_map.get(row["id"], []),
+                        )
+                    )
+                self._send(200, {"items": rows})
+                return
+            embedder_kind = get_embedder(conn, qs.get("embedder", [None])[0])
+            qvec, model_used = embed_from_kind(embedder_kind, q)
             rows = fetch_semantic_candidates(conn, app, tag, pool, model_used, since_iso=since_iso, until_iso=until_iso, pins_only=pins_only)
             ids, vecs = build_ann_index(rows)
             sims = knn(qvec, ids, vecs, limit)
@@ -4838,6 +4931,13 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     return
                 set_setting(conn, "max_db_mb", str(intval))
                 updated["max_db_mb"] = intval
+            if "pro_enabled" in data:
+                parsed = parse_bool_value(str(data["pro_enabled"]))
+                if parsed is None:
+                    self._send(400, {"error": "invalid pro_enabled"})
+                    return
+                set_pro_enabled(conn, parsed)
+                updated["pro_enabled"] = parsed
             if "embedder" in data:
                 set_embedder(conn, str(data["embedder"]))
                 updated["embedder"] = get_embedder(conn, None)
@@ -5351,8 +5451,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="get/set config (max_bytes)")
     group_cfg = p_config.add_mutually_exclusive_group(required=True)
-    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
-    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
+    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, pro_enabled, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
+    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, pro_enabled, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd, license_type, federation_enabled)")
     p_config.set_defaults(func=cmd_config)
 
     p_purge = sub.add_parser("purge", help="purge clips by age/app/keep-last/all")

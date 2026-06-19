@@ -74,15 +74,15 @@ models run entirely on your machine; **nothing is uploaded**.
 # 1. Install the optional semantic dependencies
 pip install sentence-transformers langdetect
 
-# 2. Activate your Pro license
-python3 main.py config --set license_key YOUR_KEY
+# 2. Enable the local Pro feature flag
+python3 main.py config --set pro_enabled true
 
 # 3. Switch the embedder to semantic mode
 python3 main.py config --set embedder e5-small
 ```
 
 Existing clips keep their stored vectors when you switch modes; new clips are
-embedded with whichever mode is active.
+embedded with whichever mode is active only while `pro_enabled` is true.
 
 ---
 
@@ -98,7 +98,7 @@ unlock Pro features.
 
 **Can I cancel anytime?**
 Yes. Pro is month-to-month. If you cancel, the app keeps working — it simply
-falls back to the Free feature set (hash similarity instead of semantic search).
+falls back to the Free feature set (FTS search instead of semantic search).
 
 **What happens to my data if I downgrade?**
 Nothing is deleted. Your clips, tags, pins, and notes are all in the local

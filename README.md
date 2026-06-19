@@ -91,18 +91,19 @@ The database uses SQLite in WAL (Write-Ahead Logging) mode for concurrent read/w
 
 ### Embedding System
 
-Two embedding modes are available, switchable at runtime via `config --set embedder`:
+Embedding indexing is gated by the local `pro_enabled` flag. When it is off, new clips still land in SQLite and FTS5; vector computation and storage are skipped. When it is on, two embedding modes are available, switchable at runtime via `config --set embedder`:
 
-**Hash embeddings (default):** Fast, zero-dependency 128-dimensional vectors generated from character n-gram hashing. These provide reasonable similarity matching for exact and near-exact content without requiring any model downloads. This is the default because it works instantly with no setup.
+**Hash embeddings (default when Pro is enabled):** Fast, zero-dependency 128-dimensional vectors generated from character n-gram hashing. These provide reasonable similarity matching for exact and near-exact content without requiring any model downloads.
 
 **E5-small embeddings (opt-in):** Semantic embeddings using the `intfloat/e5-small-v2` model from the `sentence-transformers` library. These provide genuine meaning-based similarity — "authentication token refresh" will match "OAuth credential rotation" even when no keywords overlap. Enable with:
 
 ```bash
+python3 main.py config --set pro_enabled true
 pip install sentence-transformers langdetect
 python3 main.py config --set embedder e5-small
 ```
 
-Existing clips retain their stored vectors when you switch modes. New clips are embedded using whichever mode is active. Both modes produce 128-dimensional vectors stored in the `clip_vectors` table, so the search interface is identical regardless of backend.
+Existing clips retain their stored vectors when you switch modes. New clips are embedded using whichever mode is active only while `pro_enabled` is true. Both modes produce 128-dimensional vectors stored in the `clip_vectors` table, so the search interface is identical regardless of backend.
 
 ### Capture Pipeline
 
@@ -114,7 +115,7 @@ The Mother watcher loop follows this pipeline on each tick (default: 1-second in
 4. **Secret detection** — skip clips matching common secret patterns (AWS keys, GitHub PATs, private keys, Slack tokens) unless `allow_secrets` is enabled
 5. **Blocklist check** — skip if the frontmost app is in the blocklist
 6. **Metadata extraction** — capture frontmost app name and window title via `osascript`
-7. **Persistence** — insert into `clips` table, update FTS5 index, generate and store embedding vector
+7. **Persistence** — insert into `clips` table, update FTS5 index, and generate/store an embedding vector only when `pro_enabled` is true
 8. **Smart hooks** — optionally run user-provided `auto_summary_cmd` and `auto_tag_cmd` shell commands
 9. **Cap enforcement** — if clip count exceeds cap, evict oldest (FIFO) or oldest non-pinned (tiered) clips
 10. **Notification** — optionally fire a macOS toast via `osascript` displaying the saved clip
@@ -533,6 +534,7 @@ python3 main.py config --set max_bytes 32768  # write a value
 | `max_db_mb` | `512` | Database size cap in MB |
 | `allow_secrets` | `false` | Store clips matching secret patterns |
 | `notify` | `false` | macOS toast notifications on save/skip |
+| `pro_enabled` | `false` | Enable semantic embedding indexing for new clips |
 | `embedder` | `hash` | Embedding backend: `hash` or `e5-small` |
 | `evict_mode` | `fifo` | Eviction strategy: `fifo` or `tiered` (prefer non-pinned) |
 | `cap_by_app` | `{}` | JSON dict of per-app clip caps |
