@@ -1,6 +1,7 @@
 """Tests for main.py — database, clips, settings, secrets, embeddings, tags."""
 
 import hashlib
+import hmac
 import json
 import sqlite3
 from datetime import datetime, timezone, timedelta
@@ -139,6 +140,102 @@ class TestSettings:
         mfm.set_setting(conn, "key", "v1")
         mfm.set_setting(conn, "key", "v2")
         assert mfm.get_setting(conn, "key") == "v2"
+
+
+class TestLicenseState:
+    def test_default_is_free(self, conn):
+        assert mfm.is_pro_enabled(conn) is False
+        snap = mfm.license_snapshot(conn)
+        assert snap["license_type"] == "free"
+        assert snap["has_license_key"] is False
+        assert snap["upgrade_url"] == mfm.DEFAULT_UPGRADE_URL
+
+    def test_set_license_key_enables_pro(self, conn):
+        mfm.set_license_key(conn, "LIC-1234567890")
+        assert mfm.is_pro_enabled(conn) is True
+        assert mfm.get_license_key(conn) == "LIC-1234567890"
+        snap = mfm.license_snapshot(conn)
+        assert snap["license_type"] == "pro"
+        assert snap["license_status"] == "active"
+        assert snap["license_key"] == "LIC-...7890"
+
+    def test_empty_license_key_disables_pro(self, conn):
+        mfm.set_license_key(conn, "LIC-1234567890")
+        mfm.set_license_key(conn, "")
+        assert mfm.is_pro_enabled(conn) is False
+        assert mfm.get_license_key(conn) == ""
+
+    def test_set_pro_enabled_override(self, conn):
+        mfm.set_pro_enabled(conn, True)
+        assert mfm.is_pro_enabled(conn) is True
+        assert mfm.license_snapshot(conn)["license_type"] == "pro"
+
+    def test_resolve_embedder_gates_e5_without_pro(self, conn):
+        kind, warning = mfm.resolve_embedder_for_use(conn, "e5-small")
+        assert kind == "hash"
+        assert "require Pro" in warning
+
+    def test_resolve_embedder_allows_e5_with_pro(self, conn):
+        mfm.set_license_key(conn, "LIC-1234567890")
+        kind, warning = mfm.resolve_embedder_for_use(conn, "e5-small")
+        assert kind == "e5-small"
+        assert warning is None
+
+
+class TestGumroadLicenseHelpers:
+    def test_verify_signature_accepts_plain_and_prefixed_digest(self):
+        body = b"license_key=LIC-123&email=customer@example.com"
+        secret = "webhook-secret"
+        sig = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+        assert mfm.verify_gumroad_signature(body, sig, secret) is True
+        assert mfm.verify_gumroad_signature(body, f"sha256={sig}", secret) is True
+        assert mfm.verify_gumroad_signature(body, "bad", secret) is False
+
+    def test_parse_form_payload(self):
+        data = mfm.parse_gumroad_payload(
+            b"license_key=LIC-123&email=customer%40example.com",
+            "application/x-www-form-urlencoded",
+        )
+        assert data["license_key"] == "LIC-123"
+        assert data["email"] == "customer@example.com"
+
+    def test_parse_json_payload(self):
+        data = mfm.parse_gumroad_payload(
+            b'{"license_key":"LIC-123","email":"customer@example.com"}',
+            "application/json",
+        )
+        assert data["license_key"] == "LIC-123"
+        assert data["email"] == "customer@example.com"
+
+    def test_apply_event_stores_license(self, conn, monkeypatch):
+        monkeypatch.setattr(mfm, "validate_gumroad_license", lambda _conn, _key: None)
+        ok, msg, valid = mfm.apply_gumroad_license_event(
+            conn,
+            {
+                "license_key": "LIC-1234567890",
+                "email": "customer@example.com",
+                "product_permalink": "myfathermother",
+                "sale_id": "sale-1",
+            },
+        )
+
+        assert ok is True
+        assert msg == "license stored"
+        assert valid is None
+        assert mfm.is_pro_enabled(conn) is True
+        assert mfm.get_setting(conn, "gumroad_email") == "customer@example.com"
+        assert mfm.get_setting(conn, "gumroad_permalink") == "myfathermother"
+        assert mfm.get_setting(conn, "gumroad_sale_id") == "sale-1"
+
+    def test_apply_event_rejects_invalid_license(self, conn, monkeypatch):
+        monkeypatch.setattr(mfm, "validate_gumroad_license", lambda _conn, _key: False)
+        ok, msg, valid = mfm.apply_gumroad_license_event(conn, {"license_key": "BAD"})
+
+        assert ok is False
+        assert msg == "license verification failed"
+        assert valid is False
+        assert mfm.is_pro_enabled(conn) is False
 
 
 class TestBoolSettings:
@@ -1164,6 +1261,10 @@ class TestStatusSnapshot:
         assert "paused" in snap
         assert "allow_secrets" in snap
         assert "notify" in snap
+        assert "pro_enabled" in snap
+        assert "license_type" in snap
+        assert "license_status" in snap
+        assert "upgrade_url" in snap
         assert "embedder" in snap
         assert "max_bytes" in snap
         assert "max_db_mb" in snap

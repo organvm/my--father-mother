@@ -111,6 +111,7 @@ Common status codes:
 | `204` | CORS preflight succeeded |
 | `400` | Invalid input or missing required field |
 | `401` | Gumroad webhook signature failed |
+| `402` | Requested Pro-only feature without an active license |
 | `404` | Endpoint or resource not found |
 | `503` | Gumroad webhook secret is not configured |
 | `500` | Insert failed unexpectedly |
@@ -192,7 +193,7 @@ bucketed by source application.
 | `POST` | `/config` | Update runtime config |
 | `GET` | `/recent` | Recent clips with filters |
 | `GET` | `/search` | SQLite FTS5 keyword search |
-| `GET` | `/semantic_search` | Semantic search or FTS fallback |
+| `GET` | `/semantic_search` | Hash similarity or Pro e5 semantic search |
 | `GET` | `/context` | LLM-ready context bundle |
 | `GET` | `/topics` | Recent clips grouped by tag/app |
 | `GET` | `/clip` | Fetch a single clip by ID |
@@ -345,8 +346,9 @@ Accepted fields:
 | `allow_secrets` | boolean | Allow payloads matching built-in secret patterns |
 | `notify` | boolean | macOS notification setting |
 | `max_db_mb` | integer | Local database size cap |
-| `pro_enabled` | boolean/string | Enables vector indexing/search behavior |
-| `embedder` | string | `hash` or `e5-small` |
+| `pro_enabled` | boolean/string | Local Pro feature state |
+| `license_key` | string | Alias for storing a customer Pro license key |
+| `embedder` | string | `hash` or Pro-only `e5-small` |
 | `cap_by_app` | object | App-specific clip caps, keys normalized to lowercase |
 | `cap_by_tag` | object | Tag-specific clip caps, keys normalized to lowercase |
 | `evict_mode` | string | `fifo` or `tiered` |
@@ -477,9 +479,9 @@ Response:
 
 ### GET /semantic_search
 
-Returns semantically related clips when Pro/vector indexing is enabled. When
-`pro_enabled` is false, this endpoint falls back to FTS search and omits
-`score`.
+Returns similarity-ranked clips. Hash similarity is available on Free. The
+`e5-small` embedder is Pro-only; requesting it without an active license returns
+`402` with an `upgrade_url`.
 
 Query parameters:
 
@@ -1260,9 +1262,9 @@ curl -s \
 - Retrieval endpoints return full clip content. Use filters and `limit` to keep
   responses small.
 - `semantic_search` only scores clips that already have vectors for the selected
-  embedder. Clips created while `pro_enabled` was false do not have vectors;
-  only clips ingested after enabling Pro/vector settings are scored unless you
-  re-ingest the older content.
+  embedder. Free hash vectors are created by default. e5 vectors are created
+  only for clips ingested after enabling Pro and `embedder=e5-small`, unless you
+  re-ingest older content.
 - Ingest endpoints enforce `max_bytes` and secret detection. Increase
   `max_bytes` or enable `allow_secrets` only when the local security tradeoff is
   acceptable.
