@@ -50,6 +50,23 @@ DEFAULT_UI_METRICS = "default"
 DEFAULT_UI_TOOLBAR = "suggested"
 DEFAULT_PERSONAL_CLOUD_STATUS = "disconnected"
 
+# --- License / Billing ---
+LEMON_SQUEEZY_STORE_ID = "my-father-mother"
+LEMON_SQUEEZY_VARIANT_ID = "premium"
+LEMON_SQUEEZY_CHECKOUT_URL = (
+    "https://my-father-mother.lemonsqueezy.com/checkout/buy/"
+)
+LICENSE_API_URL = "https://api.lemonsqueezy.com/v1/licenses/activate"
+PREMIUM_FEATURES = [
+    "semantic-search",
+    "ai-recall",
+    "ai-fill",
+    "copilot-chats",
+    "cloud-backup",
+    "ml-engine",
+    "federation",
+]
+
 DEFAULT_MAX_BYTES = 16_384  # ~16 KB
 DEFAULT_NOTIFY = False
 DEFAULT_WATCH_SYNC_INTERVAL = 60.0
@@ -1072,6 +1089,9 @@ SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "ui_font_weight": ("str", DEFAULT_UI_FONT_WEIGHT),
     "ui_density": ("str", DEFAULT_UI_DENSITY),
     "telemetry_enabled": ("bool", False),
+    "license_key": ("str", ""),
+    "license_verified_at": ("str", ""),
+    "license_tier": ("str", "free"),
 }
 
 CONNECTED_APPS = [
@@ -1211,7 +1231,58 @@ def settings_snapshot(conn: sqlite3.Connection) -> dict:
             "mcp_host": os.environ.get("MFM_MCP_HOST", "127.0.0.1"),
             "mcp_port": os.environ.get("MFM_MCP_PORT", "39300"),
         },
+        "license": {
+            "tier": get_setting_typed(conn, "license_tier"),
+            "key_summary": _license_key_summary(get_setting_typed(conn, "license_key")),
+            "verified_at": get_setting_typed(conn, "license_verified_at"),
+            "checkout_url": LEMON_SQUEEZY_CHECKOUT_URL,
+        },
     }
+
+
+# --- License / Billing helpers ---
+def _license_key_summary(key: str) -> str:
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return key
+    return key[:4] + "..." + key[-4:]
+
+
+def verify_license_online(license_key: str) -> tuple[bool, str]:
+    """Verify a license key against Lemon Squeezy API (best-effort)."""
+    import urllib.request as ureq
+    payload = json.dumps({
+        "license_key": license_key,
+        "instance_name": platform.node() or "unknown",
+    }).encode("utf-8")
+    try:
+        req = ureq.Request(
+            LICENSE_API_URL,
+            data=payload,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        with ureq.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        if body.get("activated"):
+            return True, "verified"
+        return False, body.get("error", "activation failed")
+    except Exception as e:
+        return False, f"verification failed: {e}"
+
+
+def has_premium(conn: sqlite3.Connection) -> bool:
+    tier = get_setting_typed(conn, "license_tier")
+    return tier == "premium"
+
+
+def require_premium(conn: sqlite3.Connection, feature: str = "") -> bool:
+    if has_premium(conn):
+        return True
+    feature_note = f" ({feature})" if feature else ""
+    say(MOTHER, f"premium feature required{feature_note}. Use `license --activate KEY` or buy at {LEMON_SQUEEZY_CHECKOUT_URL}")
+    return False
 
 
 def format_setting_value(value) -> str:
@@ -2280,6 +2351,8 @@ def fetch_semantic_candidates(
 def cmd_semantic_search(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "semantic-search"):
+        return
     embedder_kind, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
     if embedder_warning:
         say(FATHER, embedder_warning)
@@ -2453,6 +2526,13 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, f"  font_weight={format_setting_value(aest.get('font_weight'))}")
     say(FATHER, f"  visual_density={format_setting_value(aest.get('visual_density'))}")
 
+    license = snap["license"]
+    say(FATHER, "License")
+    say(FATHER, f"  tier={format_setting_value(license.get('tier'))}")
+    say(FATHER, f"  key={format_setting_value(license.get('key_summary'))}")
+    say(FATHER, f"  verified_at={format_setting_value(license.get('verified_at'))}")
+    say(FATHER, f"  checkout_url={format_setting_value(license.get('checkout_url'))}")
+
     telemetry = snap["telemetry"]
     say(FATHER, "Telemetry")
     say(FATHER, f"  enabled={format_setting_value(telemetry.get('enabled'))}")
@@ -2477,6 +2557,8 @@ def cmd_settings(args: argparse.Namespace) -> None:
 def cmd_copilot(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "copilot-chats"):
+        return
     did_action = False
     if args.set_model:
         set_setting(conn, "copilot_model", args.set_model)
@@ -2544,6 +2626,8 @@ def cmd_copilot(args: argparse.Namespace) -> None:
 def cmd_ml(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "ml-engine"):
+        return
     did_action = False
     if args.context_level:
         set_setting(conn, "ml_context_level", args.context_level)
@@ -2617,6 +2701,43 @@ def cmd_ml(args: argparse.Namespace) -> None:
             FATHER,
             f"auto_context_level={auto_level}, processing_mode={proc_mode}, ltm_enabled={ltm_enabled}, ltm_permissions={perms}, source_blocklist={blocklist}",
         )
+
+
+def cmd_license(args: argparse.Namespace) -> None:
+    conn = connect_db()
+    init_db(conn)
+    if args.activate:
+        key = args.activate.strip()
+        if not key:
+            say(FATHER, "provide a license key")
+            return
+        say(FATHER, "verifying license key...")
+        ok, msg = verify_license_online(key)
+        if ok:
+            set_setting_typed(conn, "license_key", key)
+            set_setting_typed(conn, "license_tier", "premium")
+            set_setting_typed(conn, "license_verified_at", datetime.now(timezone.utc).isoformat())
+            say(FATHER, f"premium license activated — {msg}")
+        else:
+            say(FATHER, f"license activation failed: {msg}")
+        return
+    if args.deactivate:
+        set_setting_typed(conn, "license_key", "")
+        set_setting_typed(conn, "license_tier", "free")
+        set_setting_typed(conn, "license_verified_at", "")
+        say(FATHER, "license deactivated")
+        return
+    if args.checkout_url:
+        say(FATHER, f"checkout: {LEMON_SQUEEZY_CHECKOUT_URL}")
+        return
+    key = get_setting_typed(conn, "license_key")
+    tier = get_setting_typed(conn, "license_tier")
+    verified_at = get_setting_typed(conn, "license_verified_at")
+    say(FATHER, f"tier={tier}")
+    say(FATHER, f"key={_license_key_summary(key) if key else 'not set'}")
+    say(FATHER, f"verified_at={verified_at if verified_at else 'never'}")
+    say(FATHER, f"checkout_url={LEMON_SQUEEZY_CHECKOUT_URL}")
+    say(FATHER, f"premium_features: {', '.join(PREMIUM_FEATURES)}")
 
 
 def cmd_about(args: argparse.Namespace) -> None:
@@ -2789,6 +2910,8 @@ def cmd_export_md(args: argparse.Namespace) -> None:
 def cmd_federate_export(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "federation"):
+        return
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
     items = export_items(conn, args.limit, app=args.app, tag=args.tag, since_iso=since_iso, pins_only=args.pins_only)
     payload = {"items": items}
@@ -2803,6 +2926,8 @@ def cmd_federate_export(args: argparse.Namespace) -> None:
 def cmd_federate_push(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "federation"):
+        return
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
     items = export_items(conn, args.limit, app=args.app, tag=args.tag, since_iso=since_iso, pins_only=args.pins_only)
     payload = json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
@@ -3124,6 +3249,8 @@ def cmd_extract(args: argparse.Namespace) -> None:
 def cmd_recall(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "ai-recall"):
+        return
     ok, msg, new_id, out = run_ai_helper(
         conn,
         "ai_recall_cmd",
@@ -3141,6 +3268,8 @@ def cmd_recall(args: argparse.Namespace) -> None:
 def cmd_fill(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "ai-fill"):
+        return
     ok, msg, new_id, out = run_ai_helper(
         conn,
         "ai_fill_cmd",
@@ -3375,6 +3504,8 @@ def perform_cloud_backup(conn: sqlite3.Connection) -> Tuple[bool, str]:
 def cmd_cloud_backup(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "cloud-backup"):
+        return
     interval = max(60, int(getattr(args, "interval", DEFAULT_BACKUP_INTERVAL) or DEFAULT_BACKUP_INTERVAL))
     if getattr(args, "loop", False):
         say(FATHER, f"cloud-backup loop started (every {interval}s); ctrl-c to stop")
@@ -3773,6 +3904,8 @@ def cmd_ingest_transcript(args: argparse.Namespace) -> None:
 def cmd_federate_import(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "federation"):
+        return
     items: list[dict] = []
     if args.path:
         src = Path(args.path).expanduser()
@@ -3807,6 +3940,8 @@ def cmd_federate_import(args: argparse.Namespace) -> None:
 def cmd_related(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
+    if not require_premium(conn, "semantic-search"):
+        return
     cur = conn.execute(
         "SELECT vector, model FROM clip_vectors WHERE clip_id = ?",
         (args.id,),
@@ -3942,6 +4077,8 @@ def cmd_palette(args: argparse.Namespace) -> None:
     rows: list[sqlite3.Row] = []
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
     if args.semantic and args.query:
+        if not require_premium(conn, "semantic-search"):
+            return
         embedder_kind, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
         if embedder_warning:
             say(FATHER, embedder_warning)
@@ -4751,10 +4888,26 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         if path == "/settings":
             self._send(200, settings_snapshot(conn))
             return
+        if path == "/license":
+            key = get_setting_typed(conn, "license_key")
+            tier = get_setting_typed(conn, "license_tier")
+            verified_at = get_setting_typed(conn, "license_verified_at")
+            self._send(200, {
+                "tier": tier,
+                "key_summary": _license_key_summary(key),
+                "verified_at": verified_at,
+                "checkout_url": LEMON_SQUEEZY_CHECKOUT_URL,
+                "has_premium": has_premium(conn),
+                "premium_features": PREMIUM_FEATURES,
+            })
+            return
         if path == "/status":
             self._send(200, status_snapshot(conn))
             return
         if path == "/federate_export":
+            if not has_premium(conn):
+                self._send(402, {"error": "premium feature — purchase at " + LEMON_SQUEEZY_CHECKOUT_URL})
+                return
             limit = int(qs.get("limit", [200])[0])
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
@@ -4832,6 +4985,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/semantic_search":
+            if not has_premium(conn):
+                self._send(402, {"error": "premium feature — purchase at " + LEMON_SQUEEZY_CHECKOUT_URL})
+                return
             q = qs.get("q", [""])[0]
             limit = int(qs.get("limit", [10])[0])
             app = qs.get("app", [None])[0]
@@ -5169,6 +5325,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(500, {"error": "failed to insert"})
             return
         if path == "/federate_import":
+            if not has_premium(conn):
+                self._send(402, {"error": "premium feature — purchase at " + LEMON_SQUEEZY_CHECKOUT_URL})
+                return
             data = self._parse_json()
             items = data.get("items")
             if not isinstance(items, list):
@@ -5226,6 +5385,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(400, {"error": msg})
             return
         if path == "/ai":
+            if not has_premium(conn):
+                self._send(402, {"error": "premium feature — purchase at " + LEMON_SQUEEZY_CHECKOUT_URL})
+                return
             data = self._parse_json()
             kind = str(data.get("kind", "")).lower()
             if kind not in ("recall", "fill"):
@@ -5252,6 +5414,30 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "id": new_id, "message": msg, "output": out})
             else:
                 self._send(400, {"error": msg})
+            return
+        if path == "/license":
+            data = self._parse_json()
+            action = data.get("action", "")
+            if action == "activate":
+                key = str(data.get("key", "")).strip()
+                if not key:
+                    self._send(400, {"error": "missing license key"})
+                    return
+                ok, msg = verify_license_online(key)
+                if ok:
+                    set_setting_typed(conn, "license_key", key)
+                    set_setting_typed(conn, "license_tier", "premium")
+                    set_setting_typed(conn, "license_verified_at", datetime.now(timezone.utc).isoformat())
+                    self._send(200, {"ok": True, "tier": "premium", "message": msg})
+                else:
+                    self._send(400, {"error": msg})
+            elif action == "deactivate":
+                set_setting_typed(conn, "license_key", "")
+                set_setting_typed(conn, "license_tier", "free")
+                set_setting_typed(conn, "license_verified_at", "")
+                self._send(200, {"ok": True, "tier": "free"})
+            else:
+                self._send(400, {"error": "action must be activate or deactivate"})
             return
         if path == "/purge":
             data = self._parse_json()
@@ -5475,6 +5661,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_ml.add_argument("--yes", action="store_true", help="confirm destructive actions")
     p_ml.add_argument("--status", action="store_true", help="show ML/LTM status")
     p_ml.set_defaults(func=cmd_ml)
+
+    p_license = sub.add_parser("license", help="manage premium license activation")
+    p_license.add_argument("--activate", help="activate a license key (verifies online)")
+    p_license.add_argument("--deactivate", action="store_true", help="deactivate license")
+    p_license.add_argument("--checkout-url", action="store_true", help="print the purchase URL")
+    p_license.set_defaults(func=cmd_license)
 
     p_about = sub.add_parser("about", help="show app/about info")
     p_about.add_argument("--json", action="store_true", help="print JSON output")
