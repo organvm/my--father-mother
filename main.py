@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -58,6 +59,8 @@ EMBED_DIM = 128
 DEFAULT_EVICT_MODE = "fifo"  # fifo|tiered
 DEFAULT_ALLOW_PDF = False
 DEFAULT_ALLOW_IMAGES = False
+DEFAULT_UPGRADE_URL = "https://gumroad.com/l/my-father-mother-pro"
+GUMROAD_VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
 ALLOWED_EXTS = {
     ".txt",
     ".md",
@@ -612,10 +615,12 @@ def stats(conn: sqlite3.Connection) -> dict:
 
 def status_snapshot(conn: sqlite3.Connection) -> dict:
     s = stats(conn)
+    license_info = license_snapshot(conn)
     return {
         "paused": is_paused(conn),
         "allow_secrets": get_allow_secrets(conn, None),
         "notify": get_notify(conn, None),
+        "pro_enabled": license_info["pro_enabled"],
         "embedder": get_embedder(conn, None),
         "max_bytes": get_max_bytes(conn, None),
         "max_db_mb": get_max_db_mb(conn, None),
@@ -631,6 +636,11 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "blocklist_size": len(get_blocklist(conn)),
         "sync_target": get_setting(conn, "sync_target", ""),
         "sync_interval": get_sync_interval(conn),
+        "license_type": license_info["license_type"],
+        "license_status": license_info["license_status"],
+        "has_license_key": license_info["has_license_key"],
+        "device_count": license_info["device_count"],
+        "upgrade_url": license_info["upgrade_url"],
     }
 
 
@@ -744,6 +754,172 @@ def set_bool_setting(conn: sqlite3.Connection, key: str, value: bool) -> None:
     set_setting(conn, key, "1" if value else "0")
 
 
+def get_license_key(conn: sqlite3.Connection) -> str:
+    """Return the configured Pro license key, supporting the public alias."""
+    return (
+        get_setting(conn, "gumroad_license_key", "").strip()
+        or get_setting(conn, "license_key", "").strip()
+    )
+
+
+def mask_secret(value: str) -> str:
+    clean = (value or "").strip()
+    if not clean:
+        return ""
+    if len(clean) <= 8:
+        return "***"
+    return f"{clean[:4]}...{clean[-4:]}"
+
+
+def set_license_key(conn: sqlite3.Connection, value: str) -> None:
+    clean = (value or "").strip()
+    set_setting(conn, "gumroad_license_key", clean)
+    set_setting(conn, "license_key", clean)
+    if clean:
+        set_bool_setting(conn, "pro_enabled", True)
+        set_setting(conn, "license_type", "pro")
+        set_setting(conn, "license_status", "active")
+        set_setting(conn, "license_updated_at", datetime.now(timezone.utc).isoformat())
+    else:
+        set_bool_setting(conn, "pro_enabled", False)
+        set_setting(conn, "license_type", "free")
+        set_setting(conn, "license_status", "inactive")
+        set_setting(conn, "license_updated_at", datetime.now(timezone.utc).isoformat())
+
+
+def is_pro_enabled(conn: sqlite3.Connection) -> bool:
+    raw = get_setting(conn, "pro_enabled", "").strip()
+    if raw:
+        parsed = parse_bool_value(raw)
+        if parsed is not None:
+            return parsed
+    return bool(get_license_key(conn))
+
+
+def set_pro_enabled(conn: sqlite3.Connection, enabled: bool) -> None:
+    set_bool_setting(conn, "pro_enabled", enabled)
+    set_setting(conn, "license_type", "pro" if enabled else "free")
+    if not enabled:
+        set_setting(conn, "license_status", "inactive")
+
+
+def get_upgrade_url(conn: sqlite3.Connection) -> str:
+    return get_setting(conn, "upgrade_url", DEFAULT_UPGRADE_URL).strip() or DEFAULT_UPGRADE_URL
+
+
+def license_snapshot(conn: sqlite3.Connection) -> dict:
+    enabled = is_pro_enabled(conn)
+    key = get_license_key(conn)
+    return {
+        "pro_enabled": enabled,
+        "license_type": "pro" if enabled else "free",
+        "license_status": get_setting(conn, "license_status", "active" if enabled else "inactive"),
+        "license_key": mask_secret(key),
+        "has_license_key": bool(key),
+        "email": get_setting(conn, "gumroad_email", ""),
+        "device_count": 1 if enabled else 0,
+        "upgrade_url": get_upgrade_url(conn),
+    }
+
+
+def pro_required(feature: str, conn: sqlite3.Connection) -> tuple[bool, str]:
+    if is_pro_enabled(conn):
+        return True, ""
+    return False, f"{feature} requires Pro. Activate with `config --set license_key YOUR_KEY`."
+
+
+def resolve_embedder_for_use(
+    conn: sqlite3.Connection,
+    override: Optional[str],
+) -> tuple[str, Optional[str]]:
+    kind = get_embedder(conn, override)
+    if kind == "e5-small" and not is_pro_enabled(conn):
+        return "hash", "e5-small embeddings require Pro; using hash similarity"
+    return kind, None
+
+
+def gumroad_webhook_secret(conn: sqlite3.Connection) -> str:
+    return os.environ.get("GUMROAD_WEBHOOK_SECRET", "").strip() or get_setting(
+        conn, "gumroad_webhook_secret", ""
+    ).strip()
+
+
+def verify_gumroad_signature(body: bytes, signature: str, secret: str) -> bool:
+    sig = (signature or "").strip()
+    if sig.startswith("sha256="):
+        sig = sig.split("=", 1)[1].strip()
+    if not sig or not secret:
+        return False
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def parse_gumroad_payload(body: bytes, content_type: str) -> dict:
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    text = body.decode("utf-8", errors="ignore")
+    if ctype == "application/json":
+        try:
+            data = json.loads(text)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    parsed = urllib.parse.parse_qs(text, keep_blank_values=True)
+    return {key: vals[-1] if vals else "" for key, vals in parsed.items()}
+
+
+def validate_gumroad_license(conn: sqlite3.Connection, license_key: str) -> Optional[bool]:
+    permalink = get_setting(conn, "gumroad_permalink", "").strip()
+    if not permalink or not license_key:
+        return None
+    payload = urllib.parse.urlencode(
+        {
+            "product_permalink": permalink,
+            "license_key": license_key,
+            "increment_uses_count": "false",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        GUMROAD_VERIFY_URL,
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+    if not data.get("success"):
+        return False
+    purchase = data.get("purchase") or {}
+    blocked = any(
+        bool(purchase.get(flag))
+        for flag in ("refunded", "chargebacked", "disputed", "subscription_cancelled")
+    )
+    return not blocked
+
+
+def apply_gumroad_license_event(conn: sqlite3.Connection, payload: dict) -> tuple[bool, str, Optional[bool]]:
+    license_key = str(payload.get("license_key") or "").strip()
+    if not license_key:
+        return False, "missing license_key", None
+    for payload_key, setting_key in (
+        ("email", "gumroad_email"),
+        ("product_permalink", "gumroad_permalink"),
+        ("sale_id", "gumroad_sale_id"),
+        ("product_id", "gumroad_product_id"),
+    ):
+        val = str(payload.get(payload_key) or "").strip()
+        if val:
+            set_setting(conn, setting_key, val)
+    valid = validate_gumroad_license(conn, license_key)
+    if valid is False:
+        set_setting(conn, "license_status", "invalid")
+        return False, "license verification failed", valid
+    set_license_key(conn, license_key)
+    set_setting(conn, "license_status", "active" if valid is not False else "pending")
+    return True, "license stored", valid
+
+
 SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "account_email": ("str", ""),
     "account_avatar": ("str", ""),
@@ -840,13 +1016,18 @@ def mcp_base_url() -> str:
 
 def settings_snapshot(conn: sqlite3.Connection) -> dict:
     base = mcp_base_url()
+    license_info = license_snapshot(conn)
     return {
         "account": {
             "email": get_setting_typed(conn, "account_email"),
             "avatar": get_setting_typed(conn, "account_avatar"),
             "linked_accounts": get_setting_typed(conn, "account_linked"),
             "organizations": get_setting_typed(conn, "account_orgs"),
-            "upgrade_url": get_setting_typed(conn, "account_upgrade_url"),
+            "upgrade_url": license_info["upgrade_url"],
+            "pro_enabled": license_info["pro_enabled"],
+            "license_type": license_info["license_type"],
+            "license_status": license_info["license_status"],
+            "has_license_key": license_info["has_license_key"],
         },
         "personal_cloud": {
             "status": get_setting_typed(conn, "personal_cloud_status"),
@@ -1167,7 +1348,7 @@ def embed_from_kind(kind: str, text: str) -> tuple[list[float], str]:
 
 
 def embed_text(conn: sqlite3.Connection, text: str, embedder_override: Optional[str] = None) -> tuple[list[float], str]:
-    kind = get_embedder(conn, embedder_override)
+    kind, _warning = resolve_embedder_for_use(conn, embedder_override)
     return embed_from_kind(kind, text)
 
 
@@ -1587,7 +1768,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     notify_override: Optional[bool] = True if args.notify else False if args.no_notify else None
     notify_enabled = get_notify(conn, notify_override)
-    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
+    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
+    if embedder_warning:
+        say(FATHER, embedder_warning)
     cap_by_app = get_cap_map(conn, "cap_by_app")
     auto_summary_cmd = get_setting(conn, "auto_summary_cmd", "").strip()
     auto_tag_cmd = get_setting(conn, "auto_tag_cmd", "").strip()
@@ -1621,6 +1804,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 ltm_enabled = get_bool_setting(conn, "ltm_enabled", DEFAULT_LTM_ENABLED)
                 allow_summary, allow_tags = auto_context_flags(context_level)
                 if not ltm_enabled:
+                    allow_summary = False
+                    allow_tags = False
+                if not is_pro_enabled(conn):
                     allow_summary = False
                     allow_tags = False
                 digest = hashlib.sha256(clip.encode("utf-8")).hexdigest()
@@ -1968,7 +2154,10 @@ def fetch_semantic_candidates(
 def cmd_semantic_search(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    qvec, model_used = embed_from_kind(get_embedder(conn, getattr(args, "embedder", None)), args.query)
+    embedder_kind, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
+    if embedder_warning:
+        say(FATHER, embedder_warning)
+    qvec, model_used = embed_from_kind(embedder_kind, args.query)
     since_iso = parse_iso_dt(args.since) if getattr(args, "since", None) else None
     if getattr(args, "since_hours", None) is not None:
         since_iso = iso_hours_ago(args.since_hours)
@@ -2033,7 +2222,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     latest = snap["latest"] or "n/a"
     say(
         FATHER,
-        f"capture={'paused' if snap['paused'] else 'active'}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
+        f"capture={'paused' if snap['paused'] else 'active'}, tier={snap['license_type']}, pro_enabled={snap['pro_enabled']}, license_status={snap['license_status']}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
         f"ltm={snap['ltm_enabled']}, ml_context={snap['ml_context_level']}, ml_mode={snap['ml_processing_mode']}, "
         f"max_bytes={snap['max_bytes']}, max_db_mb={snap['max_db_mb']}, evict_mode={snap['evict_mode']}, clips={snap['count']}, latest={latest}, db={snap['db_size_mb']:.2f} MB, blocklisted_apps={snap['blocklist_size']}, cap_by_app={snap['cap_by_app']}, cap_by_tag={snap['cap_by_tag']}",
     )
@@ -2083,6 +2272,10 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, f"  linked_accounts={format_setting_value(account.get('linked_accounts'))}")
     say(FATHER, f"  organizations={format_setting_value(account.get('organizations'))}")
     say(FATHER, f"  upgrade_url={format_setting_value(account.get('upgrade_url'))}")
+    say(FATHER, f"  pro_enabled={format_setting_value(account.get('pro_enabled'))}")
+    say(FATHER, f"  license_type={format_setting_value(account.get('license_type'))}")
+    say(FATHER, f"  license_status={format_setting_value(account.get('license_status'))}")
+    say(FATHER, f"  has_license_key={format_setting_value(account.get('has_license_key'))}")
 
     cloud = snap["personal_cloud"]
     say(FATHER, "Personal Cloud")
@@ -2516,6 +2709,18 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key == "embedder":
             val = get_embedder(conn, None)
             say(FATHER, f"embedder={val}")
+        elif key == "pro_enabled":
+            say(FATHER, f"pro_enabled={is_pro_enabled(conn)}")
+        elif key == "license_type":
+            say(FATHER, f"license_type={license_snapshot(conn)['license_type']}")
+        elif key in ("license_key", "gumroad_license_key"):
+            say(FATHER, f"{key}={mask_secret(get_license_key(conn))}")
+        elif key == "gumroad_webhook_secret":
+            say(FATHER, f"gumroad_webhook_secret={'***set***' if gumroad_webhook_secret(conn) else ''}")
+        elif key == "gumroad_permalink":
+            say(FATHER, f"gumroad_permalink={get_setting(conn, 'gumroad_permalink', '')}")
+        elif key == "upgrade_url":
+            say(FATHER, f"upgrade_url={get_upgrade_url(conn)}")
         elif key == "cap_by_app":
             say(FATHER, f"cap_by_app={get_cap_map(conn, 'cap_by_app')}")
         elif key == "cap_by_tag":
@@ -2593,8 +2798,31 @@ def cmd_config(args: argparse.Namespace) -> None:
             else:
                 say(FATHER, "value must be true/false or 1/0")
         elif key == "embedder":
-            set_embedder(conn, value)
-            say(FATHER, f"set embedder={get_embedder(conn, None)}")
+            requested_embedder = get_embedder(conn, value)
+            if requested_embedder == "e5-small" and not is_pro_enabled(conn):
+                say(FATHER, f"e5-small embeddings require Pro. Upgrade: {get_upgrade_url(conn)}")
+            else:
+                set_embedder(conn, value)
+                say(FATHER, f"set embedder={get_embedder(conn, None)}")
+        elif key == "pro_enabled":
+            parsed = parse_bool_value(value)
+            if parsed is None:
+                say(FATHER, "value must be true/false or 1/0")
+            else:
+                set_pro_enabled(conn, parsed)
+                say(FATHER, f"set pro_enabled={is_pro_enabled(conn)}")
+        elif key in ("license_key", "gumroad_license_key"):
+            set_license_key(conn, value)
+            say(FATHER, f"license stored; pro_enabled={is_pro_enabled(conn)}")
+        elif key == "gumroad_webhook_secret":
+            set_setting(conn, "gumroad_webhook_secret", value)
+            say(FATHER, "set gumroad_webhook_secret (hidden)")
+        elif key == "gumroad_permalink":
+            set_setting(conn, "gumroad_permalink", value)
+            say(FATHER, f"set gumroad_permalink={value}")
+        elif key == "upgrade_url":
+            set_setting(conn, "upgrade_url", value)
+            say(FATHER, f"set upgrade_url={get_upgrade_url(conn)}")
         elif key == "cap_by_app":
             try:
                 data = json.loads(value)
@@ -3343,7 +3571,9 @@ def cmd_ingest_file(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     if args.allow_pdf is not None:
         set_allow_pdf(conn, args.allow_pdf)
-    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
+    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
+    if embedder_warning:
+        say(FATHER, embedder_warning)
     path = Path(args.path).expanduser()
     if not path.exists():
         say(MOTHER, f"path not found: {path}")
@@ -3361,7 +3591,9 @@ def cmd_watch_inbox(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     if args.allow_pdf is not None:
         set_allow_pdf(conn, args.allow_pdf)
-    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
+    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
+    if embedder_warning:
+        say(FATHER, embedder_warning)
     interval = max(1.0, args.interval)
     say(MOTHER, f"watching inbox {inbox_dir} (extensions: {', '.join(sorted(ALLOWED_EXTS))})")
     try:
@@ -3383,7 +3615,9 @@ def cmd_ingest_image(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     if args.allow_images:
         set_allow_images(conn, True)
-    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
+    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
+    if embedder_warning:
+        say(FATHER, embedder_warning)
     path = Path(args.path).expanduser()
     if not path.exists():
         say(MOTHER, f"path not found: {path}")
@@ -3398,7 +3632,9 @@ def cmd_ingest_transcript(args: argparse.Namespace) -> None:
     init_db(conn)
     max_bytes = get_max_bytes(conn, args.max_bytes)
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
-    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
+    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
+    if embedder_warning:
+        say(FATHER, embedder_warning)
     path = Path(args.path).expanduser()
     if not path.exists():
         say(MOTHER, f"path not found: {path}")
@@ -3580,7 +3816,9 @@ def cmd_palette(args: argparse.Namespace) -> None:
     rows: list[sqlite3.Row] = []
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
     if args.semantic and args.query:
-        embedder_kind = get_embedder(conn, getattr(args, "embedder", None))
+        embedder_kind, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
+        if embedder_warning:
+            say(FATHER, embedder_warning)
         qvec, model_used = embed_from_kind(embedder_kind, args.query)
         rows_sem = fetch_semantic_candidates(conn, args.app, args.tag, args.limit * 5, model_used, since_iso=since_iso, pins_only=args.pins_only)
         ids, vecs = build_ann_index(rows_sem)
@@ -3705,6 +3943,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
+    def _read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            return b""
+        return self.rfile.read(length)
+
     def log_message(self, format: str, *args) -> None:
         # Quiet by default
         return
@@ -3713,7 +3957,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Gumroad-Signature")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -4212,6 +4456,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/config":
             mb = get_max_bytes(conn, None)
+            license_info = license_snapshot(conn)
             self._send(
                 200,
                 {
@@ -4220,10 +4465,17 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     "allow_secrets": get_allow_secrets(conn, None),
                     "notify": get_notify(conn, None),
                     "max_db_mb": get_max_db_mb(conn, None),
+                    "pro_enabled": license_info["pro_enabled"],
+                    "license_type": license_info["license_type"],
+                    "license_status": license_info["license_status"],
+                    "has_license_key": license_info["has_license_key"],
+                    "upgrade_url": license_info["upgrade_url"],
                     "embedder": get_embedder(conn, None),
                     "cap_by_app": get_cap_map(conn, "cap_by_app"),
                     "cap_by_tag": get_cap_map(conn, "cap_by_tag"),
                     "evict_mode": get_evict_mode(conn),
+                    "gumroad_permalink": get_setting(conn, "gumroad_permalink", ""),
+                    "gumroad_webhook_secret": "***" if gumroad_webhook_secret(conn) else "",
                     "sync_target": get_setting(conn, "sync_target", ""),
                     "sync_interval": get_sync_interval(conn),
                     "ai_recall_cmd": get_setting(conn, "ai_recall_cmd", ""),
@@ -4323,7 +4575,18 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
             pool = int(qs.get("pool", [2000])[0])
-            embedder_kind = get_embedder(conn, qs.get("embedder", [None])[0])
+            requested_embedder = get_embedder(conn, qs.get("embedder", [None])[0])
+            if requested_embedder == "e5-small" and not is_pro_enabled(conn):
+                self._send(
+                    402,
+                    {
+                        "error": "e5-small semantic search requires Pro",
+                        "pro_enabled": False,
+                        "upgrade_url": get_upgrade_url(conn),
+                    },
+                )
+                return
+            embedder_kind, _embedder_warning = resolve_embedder_for_use(conn, qs.get("embedder", [None])[0])
             qvec, model_used = embed_from_kind(embedder_kind, q)
             pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
             since_param = qs.get("since", [None])[0]
@@ -4370,6 +4633,32 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         path = self.path
         conn = self.conn
         init_db(conn)
+        if path == "/webhooks/gumroad":
+            body = self._read_body()
+            secret = gumroad_webhook_secret(conn)
+            if not secret:
+                self._send(503, {"error": "gumroad webhook secret is not configured"})
+                return
+            signature = self.headers.get("X-Gumroad-Signature", "")
+            if not verify_gumroad_signature(body, signature, secret):
+                self._send(401, {"error": "invalid signature"})
+                return
+            payload = parse_gumroad_payload(body, self.headers.get("Content-Type", ""))
+            ok, msg, valid = apply_gumroad_license_event(conn, payload)
+            if not ok:
+                status = 400 if msg == "missing license_key" else 401
+                self._send(status, {"error": msg, "license_valid": valid})
+                return
+            self._send(
+                200,
+                {
+                    "ok": True,
+                    "stored": True,
+                    "pro_enabled": is_pro_enabled(conn),
+                    "license_valid": True if valid is None else valid,
+                },
+            )
+            return
         if path == "/pin":
             data = self._parse_json()
             try:
@@ -4434,7 +4723,45 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     return
                 set_setting(conn, "max_db_mb", str(intval))
                 updated["max_db_mb"] = intval
+            if "pro_enabled" in data:
+                parsed = data["pro_enabled"] if isinstance(data["pro_enabled"], bool) else parse_bool_value(str(data["pro_enabled"]))
+                if parsed is None:
+                    self._send(400, {"error": "invalid pro_enabled"})
+                    return
+                set_pro_enabled(conn, bool(parsed))
+                updated["pro_enabled"] = is_pro_enabled(conn)
+                updated["license_type"] = license_snapshot(conn)["license_type"]
+            if "license_key" in data:
+                set_license_key(conn, str(data["license_key"]))
+                updated["license_key"] = mask_secret(get_license_key(conn))
+                updated["pro_enabled"] = is_pro_enabled(conn)
+                updated["license_type"] = license_snapshot(conn)["license_type"]
+            if "gumroad_license_key" in data:
+                set_license_key(conn, str(data["gumroad_license_key"]))
+                updated["gumroad_license_key"] = mask_secret(get_license_key(conn))
+                updated["pro_enabled"] = is_pro_enabled(conn)
+                updated["license_type"] = license_snapshot(conn)["license_type"]
+            if "gumroad_webhook_secret" in data:
+                set_setting(conn, "gumroad_webhook_secret", str(data["gumroad_webhook_secret"]))
+                updated["gumroad_webhook_secret"] = "***" if gumroad_webhook_secret(conn) else ""
+            if "gumroad_permalink" in data:
+                set_setting(conn, "gumroad_permalink", str(data["gumroad_permalink"]))
+                updated["gumroad_permalink"] = get_setting(conn, "gumroad_permalink", "")
+            if "upgrade_url" in data:
+                set_setting(conn, "upgrade_url", str(data["upgrade_url"]))
+                updated["upgrade_url"] = get_upgrade_url(conn)
             if "embedder" in data:
+                requested_embedder = get_embedder(conn, str(data["embedder"]))
+                if requested_embedder == "e5-small" and not is_pro_enabled(conn):
+                    self._send(
+                        402,
+                        {
+                            "error": "e5-small embeddings require Pro",
+                            "pro_enabled": False,
+                            "upgrade_url": get_upgrade_url(conn),
+                        },
+                    )
+                    return
                 set_embedder(conn, str(data["embedder"]))
                 updated["embedder"] = get_embedder(conn, None)
             if "cap_by_app" in data:
@@ -4923,8 +5250,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="get/set config (max_bytes)")
     group_cfg = p_config.add_mutually_exclusive_group(required=True)
-    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
-    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, pro_enabled, license_key, gumroad_* settings, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_* settings, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, pro_enabled, license_key, gumroad_* settings, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_* settings, ai_recall_cmd, ai_fill_cmd)")
     p_config.set_defaults(func=cmd_config)
 
     p_purge = sub.add_parser("purge", help="purge clips by age/app/keep-last/all")
