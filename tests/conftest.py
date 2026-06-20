@@ -41,6 +41,9 @@ def populated_db(conn):
     conn.commit()
     # Manually populate FTS (triggers only fire on real inserts through the trigger)
     for row in conn.execute("SELECT id, content FROM clips").fetchall():
-        conn.execute("INSERT INTO clips_fts(rowid, content) VALUES (?, ?)", (row["id"], row["content"]))
+        conn.execute(
+            "INSERT INTO clips_fts(rowid, content) VALUES (?, ?)",
+            (row["id"], row["content"]),
+        )
     conn.commit()
     return conn

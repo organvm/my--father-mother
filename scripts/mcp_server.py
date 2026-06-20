@@ -38,7 +38,16 @@ def json_bytes(obj: dict) -> bytes:
 def recent_items(limit: int = 20) -> list[dict]:
     conn = mfm.connect_db()
     mfm.init_db(conn)
-    rows, tag_map = mfm.filtered_rows(conn, limit, app=None, contains=None, tag=None, pins_only=False, since_iso=None, until_iso=None)
+    rows, tag_map = mfm.filtered_rows(
+        conn,
+        limit,
+        app=None,
+        contains=None,
+        tag=None,
+        pins_only=False,
+        since_iso=None,
+        until_iso=None,
+    )
     notes_map = mfm.notes_for_clips(conn, [row["id"] for row in rows])
     items = []
     for row in rows:
@@ -59,13 +68,27 @@ def recent_items(limit: int = 20) -> list[dict]:
     return items
 
 
-def context_items(limit: int = 20, app: str | None = None, tag: str | None = None, hours: float | None = None, pins_only: bool = False) -> list[dict]:
+def context_items(
+    limit: int = 20,
+    app: str | None = None,
+    tag: str | None = None,
+    hours: float | None = None,
+    pins_only: bool = False,
+) -> list[dict]:
     conn = mfm.connect_db()
     mfm.init_db(conn)
-    return mfm.context_bundle(conn, app=app, tag=tag, limit=limit, hours=hours, pins_only=pins_only)
+    return mfm.context_bundle(
+        conn, app=app, tag=tag, limit=limit, hours=hours, pins_only=pins_only
+    )
 
 
-def search_items(q: str, limit: int = 20, app: str | None = None, tag: str | None = None, pins_only: bool = False) -> list[dict]:
+def search_items(
+    q: str,
+    limit: int = 20,
+    app: str | None = None,
+    tag: str | None = None,
+    pins_only: bool = False,
+) -> list[dict]:
     conn = mfm.connect_db()
     mfm.init_db(conn)
     clauses = ["clips_fts MATCH ?"]
@@ -171,14 +194,21 @@ class MCPHandler(BaseHTTPRequestHandler):
                 limit = 20
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
-            pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            pins_only = qs.get("pins_only", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             hours = None
             if "hours" in qs:
                 try:
                     hours = float(qs["hours"][0])
                 except Exception:
                     hours = None
-            items = context_items(limit=limit, app=app, tag=tag, hours=hours, pins_only=pins_only)
+            items = context_items(
+                limit=limit, app=app, tag=tag, hours=hours, pins_only=pins_only
+            )
             self._send_json(200, {"items": items})
             return
         if path == "/mcp/search":
@@ -189,7 +219,12 @@ class MCPHandler(BaseHTTPRequestHandler):
                 limit = 20
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
-            pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
+            pins_only = qs.get("pins_only", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
             items = search_items(q, limit=limit, app=app, tag=tag, pins_only=pins_only)
             self._send_json(200, {"items": items})
             return
@@ -201,7 +236,9 @@ class MCPHandler(BaseHTTPRequestHandler):
             self.end_headers()
             for _ in range(60):  # ~60 seconds of heartbeats
                 stats = mfm.status_snapshot(mfm.connect_db())
-                payload = json.dumps({"count": stats.get("count"), "latest": stats.get("latest")})
+                payload = json.dumps(
+                    {"count": stats.get("count"), "latest": stats.get("latest")}
+                )
                 try:
                     self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
@@ -217,7 +254,9 @@ class MCPHandler(BaseHTTPRequestHandler):
 
 def serve() -> None:
     server = HTTPServer((HOST, PORT), MCPHandler)
-    print(f"[mcp] serving on http://{HOST}:{PORT}/model_context_protocol/2025-03-26/mcp (Ctrl+C to stop)")
+    print(
+        f"[mcp] serving on http://{HOST}:{PORT}/model_context_protocol/2025-03-26/mcp (Ctrl+C to stop)"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

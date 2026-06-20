@@ -86,9 +86,8 @@ def test_end_to_end_flow(tmp_path, monkeypatch, capsys):
 
     # 11. Test deletion
     assert mfm.main(["delete", "--id", str(clip_id)]) == 0
-    
+
     # 12. Verify deletion
     assert mfm.main(["recent"]) == 0
     out, err = capsys.readouterr()
     assert "Integration test snippet!" not in out
-

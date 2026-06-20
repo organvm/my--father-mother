@@ -7,16 +7,19 @@ from datetime import datetime, timezone, timedelta
 
 import main as mfm
 
-
 # ──────────────────────────────────────────────
 # Database + Schema
 # ──────────────────────────────────────────────
 
+
 class TestInitDb:
     def test_creates_tables(self, conn):
-        tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
         assert "clips" in tables
         assert "clips_fts" in tables
         assert "settings" in tables
@@ -56,6 +59,7 @@ class TestColumnExists:
 # Clip CRUD
 # ──────────────────────────────────────────────
 
+
 class TestClipExists:
     def test_missing(self, conn):
         assert mfm.clip_exists(conn, "deadbeef") is False
@@ -94,7 +98,9 @@ class TestInsertClip:
 
     def test_stores_embedding(self, conn):
         cid = mfm.insert_clip(conn, "embedding test", "App", "Win")
-        vec_row = conn.execute("SELECT * FROM clip_vectors WHERE clip_id = ?", (cid,)).fetchone()
+        vec_row = conn.execute(
+            "SELECT * FROM clip_vectors WHERE clip_id = ?", (cid,)
+        ).fetchone()
         assert vec_row is not None
         assert vec_row["model"] == "hash"
         assert vec_row["dim"] == mfm.EMBED_DIM
@@ -104,7 +110,9 @@ class TestInsertEvent:
     def test_inserts_event(self, populated_db):
         cid = populated_db.execute("SELECT id FROM clips LIMIT 1").fetchone()["id"]
         mfm.insert_event(populated_db, cid)
-        events = populated_db.execute("SELECT * FROM clip_events WHERE clip_id = ?", (cid,)).fetchall()
+        events = populated_db.execute(
+            "SELECT * FROM clip_events WHERE clip_id = ?", (cid,)
+        ).fetchall()
         assert len(events) == 1
 
 
@@ -126,6 +134,7 @@ class TestPrune:
 # ──────────────────────────────────────────────
 # Settings
 # ──────────────────────────────────────────────
+
 
 class TestSettings:
     def test_get_default(self, conn):
@@ -175,12 +184,15 @@ class TestParseBoolValue:
 # Secrets
 # ──────────────────────────────────────────────
 
+
 class TestSecrets:
     def test_aws_key_detected(self):
         assert mfm.looks_like_secret("AKIAIOSFODNN7EXAMPLE") is True  # allow-secret
 
     def test_github_pat_detected(self):
-        assert mfm.looks_like_secret("ghp_ABCDEFghijklmnopqrstuvwxyz0123456789") is True  # allow-secret
+        assert (
+            mfm.looks_like_secret("ghp_ABCDEFghijklmnopqrstuvwxyz0123456789") is True
+        )  # allow-secret
 
     def test_private_key_detected(self):
         assert mfm.looks_like_secret("-----BEGIN RSA PRIVATE KEY") is True
@@ -214,6 +226,7 @@ class TestAllowSecrets:
 # ──────────────────────────────────────────────
 # Tags
 # ──────────────────────────────────────────────
+
 
 class TestTags:
     def test_get_or_create(self, conn):
@@ -275,6 +288,7 @@ class TestTags:
 # Notes
 # ──────────────────────────────────────────────
 
+
 class TestNotes:
     def test_add_note(self, populated_db):
         cid = populated_db.execute("SELECT id FROM clips LIMIT 1").fetchone()["id"]
@@ -293,6 +307,7 @@ class TestNotes:
 # ──────────────────────────────────────────────
 # Blocklist
 # ──────────────────────────────────────────────
+
 
 class TestBlocklist:
     def test_empty_by_default(self, conn):
@@ -322,6 +337,7 @@ class TestBlocklist:
 # ──────────────────────────────────────────────
 # Embeddings
 # ──────────────────────────────────────────────
+
 
 class TestTokenize:
     def test_basic(self):
@@ -405,13 +421,21 @@ class TestStoreAndLoadEmbedding:
     def test_round_trip(self, conn):
         conn.execute(
             "INSERT INTO clips (created_at, source_app, window_title, content, hash, pinned, lang) VALUES (?,?,?,?,?,0,'unk')",
-            ("2026-01-01", "App", "Win", "test", "abc", ),
+            (
+                "2026-01-01",
+                "App",
+                "Win",
+                "test",
+                "abc",
+            ),
         )
         conn.commit()
         cid = conn.execute("SELECT id FROM clips LIMIT 1").fetchone()["id"]
         vec = [0.1, 0.2, 0.3]
         mfm.store_embedding(conn, cid, vec, "hash")
-        row = conn.execute("SELECT * FROM clip_vectors WHERE clip_id = ?", (cid,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM clip_vectors WHERE clip_id = ?", (cid,)
+        ).fetchone()
         loaded = mfm.load_embedding(row)
         assert loaded == vec
 
@@ -419,6 +443,7 @@ class TestStoreAndLoadEmbedding:
 # ──────────────────────────────────────────────
 # Utility helpers
 # ──────────────────────────────────────────────
+
 
 class TestParseIsoDt:
     def test_valid(self):
