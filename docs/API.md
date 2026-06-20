@@ -184,10 +184,11 @@ bucketed by source application.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/` or `/ui` | Built-in web interface |
+| `GET` | `/`, `/ui`, or `/dashboard` | Built-in web interface |
 | `GET` | `/health` | Health check |
 | `GET` | `/stats` | Minimal counts and DB size |
 | `GET` | `/status` | Operational status and limits |
+| `GET` | `/usage` | Dashboard usage rollup |
 | `GET` | `/settings` | Customer settings snapshot |
 | `GET` | `/config` | Runtime config subset |
 | `POST` | `/config` | Update runtime config |
@@ -253,7 +254,8 @@ Response:
 
 ### GET /status
 
-Returns operational settings, tier state, and local DB usage.
+Returns operational settings, tier state, local DB usage, and the dashboard
+usage rollup under `usage`.
 
 ```bash
 curl -s http://127.0.0.1:8765/status | python3 -m json.tool
@@ -284,8 +286,35 @@ Response fields include:
   "sync_interval": 60.0,
   "license_type": "pro",
   "device_count": 1,
-  "upgrade_url": "https://gumroad.com/l/my-father-mother-pro"
+  "upgrade_url": "https://gumroad.com/l/my-father-mother-pro",
+  "usage": {
+    "total_clips": 1284,
+    "pinned_clips": 43,
+    "tagged_clips": 210,
+    "note_count": 18,
+    "clips_last_24h": 37,
+    "clips_last_7d": 244,
+    "storage": {
+      "db_size_mb": 7.0,
+      "max_db_mb": 512,
+      "used_pct": 1.4
+    },
+    "vector_coverage_pct": 100.0,
+    "top_apps": [{"name": "Terminal", "count": 402, "latest": "2026-06-19T14:22:10.123456+00:00"}],
+    "top_tags": [{"name": "project", "count": 38, "latest": "2026-06-19T13:10:00+00:00"}],
+    "daily_counts": [{"day": "2026-06-19", "count": 37}]
+  }
 }
+```
+
+### GET /usage
+
+Returns the same dashboard usage rollup nested under `/status["usage"]`.
+Use this endpoint when a dashboard or widget needs metrics without the wider
+runtime configuration payload.
+
+```bash
+curl -s http://127.0.0.1:8765/usage | python3 -m json.tool
 ```
 
 ### GET /settings

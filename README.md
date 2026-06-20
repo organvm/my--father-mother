@@ -122,7 +122,7 @@ The Mother watcher loop follows this pipeline on each tick (default: 1-second in
 
 ### HTTP Server
 
-The `serve` command starts a local HTTP server (default port 8765) that exposes the full retrieval API plus a minimal web UI at the root path. The server tries up to 3 consecutive ports if the requested port is busy. Endpoints mirror CLI commands: `/recent`, `/search`, `/semantic_search`, `/context`, `/clip`, `/status`, `/pin`, `/tags`, `/dropper`, `/ingest_url`, `/recap`, `/topics`, `/federate_export`, `/federate_import`.
+The `serve` command starts a local HTTP server (default port 8765) that exposes the full retrieval API plus a minimal web UI at the root path and `/dashboard`. The server tries up to 3 consecutive ports if the requested port is busy. Endpoints mirror CLI commands: `/recent`, `/search`, `/semantic_search`, `/context`, `/clip`, `/status`, `/usage`, `/pin`, `/tags`, `/dropper`, `/ingest_url`, `/recap`, `/topics`, `/federate_export`, `/federate_import`.
 
 ### MCP Bridge
 
@@ -369,7 +369,7 @@ python3 main.py serve --port 8765
 
 ### Web Interface
 
-Navigate to `http://127.0.0.1:8765/` for a minimal but functional web UI with search, recent clips, topic bucketing, tag/pin management, and a status indicator showing paused/active state plus notification and secret-storage flags. The UI includes keyboard shortcuts (Enter to search, Cmd/Ctrl+F to focus the search input) and optional auto-refresh.
+Navigate to `http://127.0.0.1:8765/` or `http://127.0.0.1:8765/dashboard` for a minimal but functional web UI with a status/usage dashboard, search, recent clips, topic bucketing, and tag/pin management. The dashboard shows clip volume, recent activity, storage pressure, organization counts, embedding coverage, top apps, top tags, and daily capture counts. The UI includes keyboard shortcuts (Enter to search, Cmd/Ctrl+F to focus the search input) and optional auto-refresh.
 
 ### API Endpoints
 
@@ -381,6 +381,7 @@ Navigate to `http://127.0.0.1:8765/` for a minimal but functional web UI with se
 | GET | `/context` | Context bundle for LLM sidecars (params: `limit`, `app`, `tag`, `hours`, `pins_only`) |
 | GET | `/clip` | Single clip by ID (params: `id`) |
 | GET | `/status` | Runtime status (paused, notify, DB size, caps) |
+| GET | `/usage` | Dashboard usage metrics (clip volume, storage, top apps/tags, daily counts) |
 | GET | `/recap` | Recent activity summary (params: `minutes`) |
 | GET | `/topics` | Topic buckets (params: `limit`, `per_group`, `since_hours`) |
 | GET | `/tags` | List all tags |

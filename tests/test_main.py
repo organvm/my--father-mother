@@ -1273,6 +1273,8 @@ class TestStatusSnapshot:
         assert "evict_mode" in snap
         assert "count" in snap
         assert "latest" in snap
+        assert "usage" in snap
+        assert "total_clips" in snap["usage"]
 
     def test_reflects_state(self, conn):
         mfm.insert_clip(conn, "status test", "Terminal", "zsh")
@@ -1280,6 +1282,36 @@ class TestStatusSnapshot:
         snap = mfm.status_snapshot(conn)
         assert snap["paused"] is True
         assert snap["count"] == 1
+        assert snap["usage"]["total_clips"] == 1
+
+
+class TestUsageSnapshot:
+    def test_summarizes_product_usage(self, conn):
+        first = mfm.insert_clip(conn, "dashboard alpha", "Terminal", "zsh")
+        second = mfm.insert_clip(conn, "dashboard beta", "Safari", "page")
+        assert first is not None
+        assert second is not None
+
+        conn.execute("UPDATE clips SET pinned = 1 WHERE id = ?", (first,))
+        conn.commit()
+        mfm.assign_tag(conn, first, "work")
+        mfm.add_note(conn, first, "reviewed")
+        mfm.insert_event(conn, first)
+
+        snap = mfm.usage_snapshot(conn)
+
+        assert snap["total_clips"] == 2
+        assert snap["pinned_clips"] == 1
+        assert snap["tagged_clips"] == 1
+        assert snap["tag_count"] == 1
+        assert snap["note_count"] == 1
+        assert snap["repeat_events"] == 1
+        assert snap["clips_last_24h"] >= 2
+        assert snap["vector_count"] == 2
+        assert snap["vector_coverage_pct"] == 100.0
+        assert any(app["name"] == "Terminal" for app in snap["top_apps"])
+        assert snap["top_tags"][0]["name"] == "work"
+        assert snap["daily_counts"]
 
 
 # ──────────────────────────────────────────────
