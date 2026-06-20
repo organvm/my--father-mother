@@ -613,8 +613,133 @@ def stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+def usage_snapshot(conn: sqlite3.Connection, top_limit: int = 5, days: int = 7) -> dict:
+    top_limit = max(1, min(int(top_limit), 20))
+    days = max(1, min(int(days), 31))
+    base = stats(conn)
+
+    def count_value(sql: str, params: tuple = ()) -> int:
+        row = conn.execute(sql, params).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    total_clips = int(base.get("count") or 0)
+    first_row = conn.execute("SELECT MIN(created_at) AS first FROM clips").fetchone()
+    size_row = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(LENGTH(content)), 0) AS content_chars,
+            COALESCE(AVG(LENGTH(content)), 0) AS avg_clip_chars
+        FROM clips
+        """
+    ).fetchone()
+    db_size_bytes = int(base.get("db_size_bytes") or 0)
+    db_size_mb = round(db_size_bytes / (1024 * 1024), 3)
+    max_db_mb = get_max_db_mb(conn, None)
+    storage_pct = round((db_size_mb / max_db_mb) * 100, 1) if max_db_mb else None
+
+    top_apps = [
+        {
+            "name": row["name"],
+            "count": row["clip_count"],
+            "latest": row["latest"],
+        }
+        for row in conn.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(source_app, ''), 'unknown') AS name,
+                COUNT(*) AS clip_count,
+                MAX(created_at) AS latest
+            FROM clips
+            GROUP BY COALESCE(NULLIF(source_app, ''), 'unknown')
+            ORDER BY clip_count DESC, latest DESC
+            LIMIT ?
+            """,
+            (top_limit,),
+        ).fetchall()
+    ]
+    top_tags = [
+        {
+            "name": row["name"],
+            "count": row["clip_count"],
+            "latest": row["latest"],
+        }
+        for row in conn.execute(
+            """
+            SELECT t.name, COUNT(ct.clip_id) AS clip_count, MAX(c.created_at) AS latest
+            FROM tags t
+            JOIN clip_tags ct ON ct.tag_id = t.id
+            JOIN clips c ON c.id = ct.clip_id
+            GROUP BY t.id, t.name
+            ORDER BY clip_count DESC, latest DESC
+            LIMIT ?
+            """,
+            (top_limit,),
+        ).fetchall()
+    ]
+    daily_counts = [
+        {"day": row["day"], "count": row["clip_count"]}
+        for row in conn.execute(
+            """
+            SELECT date(created_at) AS day, COUNT(*) AS clip_count
+            FROM clips
+            WHERE datetime(created_at) >= datetime('now', ?)
+            GROUP BY date(created_at)
+            ORDER BY day ASC
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+    ]
+    embedding_models = [
+        {"model": row["model"], "count": row["clip_count"]}
+        for row in conn.execute(
+            """
+            SELECT model, COUNT(*) AS clip_count
+            FROM clip_vectors
+            GROUP BY model
+            ORDER BY clip_count DESC, model ASC
+            """
+        ).fetchall()
+    ]
+    vector_count = sum(item["count"] for item in embedding_models)
+    vector_coverage = round((vector_count / total_clips) * 100, 1) if total_clips else 0.0
+
+    return {
+        "total_clips": total_clips,
+        "pinned_clips": count_value("SELECT COUNT(*) FROM clips WHERE pinned = 1"),
+        "tagged_clips": count_value("SELECT COUNT(DISTINCT clip_id) FROM clip_tags"),
+        "tag_count": count_value("SELECT COUNT(*) FROM tags"),
+        "note_count": count_value("SELECT COUNT(*) FROM clip_notes"),
+        "repeat_events": count_value("SELECT COUNT(*) FROM clip_events"),
+        "clips_last_24h": count_value(
+            "SELECT COUNT(*) FROM clips WHERE datetime(created_at) >= datetime('now', '-1 day')"
+        ),
+        "clips_last_7d": count_value(
+            "SELECT COUNT(*) FROM clips WHERE datetime(created_at) >= datetime('now', '-7 days')"
+        ),
+        "events_last_24h": count_value(
+            "SELECT COUNT(*) FROM clip_events WHERE datetime(seen_at) >= datetime('now', '-1 day')"
+        ),
+        "first_clip_at": first_row["first"] if first_row else None,
+        "latest_clip_at": base.get("latest"),
+        "content_chars": int(size_row["content_chars"] or 0) if size_row else 0,
+        "average_clip_chars": round(float(size_row["avg_clip_chars"] or 0), 1) if size_row else 0.0,
+        "storage": {
+            "db_size_bytes": db_size_bytes,
+            "db_size_mb": db_size_mb,
+            "max_db_mb": max_db_mb,
+            "used_pct": storage_pct,
+        },
+        "vector_count": vector_count,
+        "vector_coverage_pct": vector_coverage,
+        "embedding_models": embedding_models,
+        "top_apps": top_apps,
+        "top_tags": top_tags,
+        "daily_counts": daily_counts,
+    }
+
+
 def status_snapshot(conn: sqlite3.Connection) -> dict:
-    s = stats(conn)
+    usage = usage_snapshot(conn)
     license_info = license_snapshot(conn)
     return {
         "paused": is_paused(conn),
@@ -630,9 +755,9 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "ltm_enabled": get_bool_setting(conn, "ltm_enabled", DEFAULT_LTM_ENABLED),
         "ml_context_level": get_setting(conn, "ml_context_level", DEFAULT_ML_CONTEXT_LEVEL),
         "ml_processing_mode": get_setting(conn, "ml_processing_mode", DEFAULT_ML_PROCESSING_MODE),
-        "count": s.get("count", 0),
-        "latest": s.get("latest"),
-        "db_size_mb": round((s.get("db_size_bytes", 0) or 0) / (1024 * 1024), 3),
+        "count": usage["total_clips"],
+        "latest": usage["latest_clip_at"],
+        "db_size_mb": usage["storage"]["db_size_mb"],
         "blocklist_size": len(get_blocklist(conn)),
         "sync_target": get_setting(conn, "sync_target", ""),
         "sync_interval": get_sync_interval(conn),
@@ -641,6 +766,7 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "has_license_key": license_info["has_license_key"],
         "device_count": license_info["device_count"],
         "upgrade_url": license_info["upgrade_url"],
+        "usage": usage,
     }
 
 
@@ -3965,7 +4091,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(query)
         conn = self.conn
         init_db(conn)
-        if path in ("/", "/ui"):
+        if path in ("/", "/ui", "/dashboard"):
             html = """
 <!doctype html>
 <html>
@@ -3973,8 +4099,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
   <meta charset="utf-8" />
   <title>my--father-mother</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; background: #0b1021; color: #e8ecf1; }
-    h1 { margin-top: 0; }
+    :root { --bg:#0b1021; --panel:#111727; --panel-2:#151d30; --line:#263149; --muted:#8fa4b8; --text:#e8ecf1; --teal:#5eead4; --gold:#f6c453; --warn:#f59e0b; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; background: var(--bg); color: var(--text); }
+    h1 { margin: 0 0 12px; }
     input, button, select { padding: 8px; margin: 4px; border-radius: 4px; border: 1px solid #334; background: #111727; color: #e8ecf1; }
     .result { padding: 8px; margin: 8px 0; border: 1px solid #223; border-radius: 6px; background: #111727; }
     .topic { border-color: #2a3b5e; }
@@ -3991,11 +4118,73 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     .status.warn { background: #302312; color: #ffc773; border: 1px solid #9b6b1a; }
     .note { background: #182035; border-radius: 4px; padding: 4px 6px; margin: 4px 0; font-size: 12px; color: #cdd7f3; }
     .note small { color: #8aa; }
+    .dashboard { margin: 0 0 16px; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 8px; margin-bottom: 8px; }
+    .metric, .panel { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+    .metric { min-height: 76px; padding: 10px; box-sizing: border-box; }
+    .metric-label, .panel-title { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
+    .metric strong { display: block; margin-top: 6px; font-size: 24px; line-height: 1.1; color: var(--text); }
+    .metric small { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .dashboard-lower { display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 8px; }
+    .panel { padding: 10px; min-height: 128px; box-sizing: border-box; }
+    .bar-list { margin-top: 8px; }
+    .bar-row { display: grid; grid-template-columns: minmax(72px, 1fr) minmax(80px, 2fr) 44px; gap: 8px; align-items: center; margin: 7px 0; font-size: 13px; }
+    .bar-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #dbe7f3; }
+    .bar-track, .storage-track { height: 8px; background: #0d1324; border-radius: 999px; overflow: hidden; border: 1px solid #1f2a44; }
+    .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--teal), var(--gold)); }
+    .bar-count { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .storage-track { margin-top: 8px; }
+    #storageBar { height: 100%; width: 0%; background: var(--teal); }
+    .empty { color: var(--muted); font-size: 13px; margin-top: 10px; }
+    @media (max-width: 820px) {
+      body { margin: 14px; }
+      .metrics, .dashboard-lower { grid-template-columns: 1fr; }
+      .bar-row { grid-template-columns: minmax(64px, 1fr) minmax(72px, 2fr) 38px; }
+    }
   </style>
 </head>
 <body>
   <h1>my--father-mother</h1>
   <div id="status" class="status"></div>
+  <section id="dashboard" class="dashboard" aria-label="Status and usage dashboard">
+    <div class="metrics">
+      <div class="metric">
+        <span class="metric-label">Clips</span>
+        <strong id="metricTotal">0</strong>
+        <small id="metricRecent">0 in 24h / 0 in 7d</small>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Storage</span>
+        <strong id="metricStorage">0 MB</strong>
+        <div class="storage-track"><div id="storageBar"></div></div>
+        <small id="metricStorageCap">cap not set</small>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Organization</span>
+        <strong id="metricOrg">0 pinned</strong>
+        <small id="metricTags">0 tagged / 0 notes</small>
+      </div>
+      <div class="metric">
+        <span class="metric-label">Index</span>
+        <strong id="metricVectors">0%</strong>
+        <small id="metricLatest">latest n/a</small>
+      </div>
+    </div>
+    <div class="dashboard-lower">
+      <div class="panel">
+        <div class="panel-title">Top apps</div>
+        <div id="topApps" class="bar-list"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Top tags</div>
+        <div id="topTags" class="bar-list"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Daily clips</div>
+        <div id="dailyClips" class="bar-list"></div>
+      </div>
+    </div>
+  </section>
   <div>
     <input id="q" placeholder="Search..." size="40"/>
     <label><input type="checkbox" id="semantic"/> semantic</label>
@@ -4023,6 +4212,74 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
   <script>
     let lastMode = 'recent';
     let autoTimer = null;
+    function formatNumber(value) {
+      return new Intl.NumberFormat().format(Number(value || 0));
+    }
+    function formatMb(value) {
+      const n = Number(value || 0);
+      const digits = n >= 10 ? 1 : 3;
+      return `${n.toFixed(digits).replace(/\\.0+$|0+$/,'').replace(/\\.$/,'')} MB`;
+    }
+    function setText(id, value) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = value;
+    }
+    function renderBars(id, items) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.innerHTML = '';
+      if (!items || !items.length) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No data yet';
+        el.appendChild(empty);
+        return;
+      }
+      const max = Math.max(...items.map(it => Number(it.count || 0)), 1);
+      items.forEach(it => {
+        const row = document.createElement('div');
+        row.className = 'bar-row';
+        const name = document.createElement('span');
+        name.className = 'bar-name';
+        name.textContent = it.name || it.day || 'unknown';
+        name.title = name.textContent;
+        const track = document.createElement('div');
+        track.className = 'bar-track';
+        const fill = document.createElement('div');
+        fill.className = 'bar-fill';
+        fill.style.width = `${Math.max(4, (Number(it.count || 0) / max) * 100)}%`;
+        track.appendChild(fill);
+        const count = document.createElement('span');
+        count.className = 'bar-count';
+        count.textContent = formatNumber(it.count);
+        row.appendChild(name);
+        row.appendChild(track);
+        row.appendChild(count);
+        el.appendChild(row);
+      });
+    }
+    function renderDashboard(s) {
+      const u = s.usage || {};
+      const storage = u.storage || {};
+      const total = Number(u.total_clips || s.count || 0);
+      const storagePct = storage.used_pct == null ? null : Math.max(0, Math.min(100, Number(storage.used_pct)));
+      setText('metricTotal', formatNumber(total));
+      setText('metricRecent', `${formatNumber(u.clips_last_24h)} in 24h / ${formatNumber(u.clips_last_7d)} in 7d`);
+      setText('metricStorage', formatMb(storage.db_size_mb || s.db_size_mb || 0));
+      setText('metricStorageCap', storagePct == null ? 'cap not set' : `${storagePct.toFixed(1)}% of ${formatMb(storage.max_db_mb)}`);
+      setText('metricOrg', `${formatNumber(u.pinned_clips)} pinned`);
+      setText('metricTags', `${formatNumber(u.tagged_clips)} tagged / ${formatNumber(u.note_count)} notes`);
+      setText('metricVectors', `${Number(u.vector_coverage_pct || 0).toFixed(1)}%`);
+      setText('metricLatest', `latest ${u.latest_clip_at || s.latest || 'n/a'}`);
+      const storageBar = document.getElementById('storageBar');
+      if (storageBar) {
+        storageBar.style.width = storagePct == null ? '0%' : `${storagePct}%`;
+        storageBar.style.background = storagePct != null && storagePct >= 80 ? 'var(--warn)' : 'var(--teal)';
+      }
+      renderBars('topApps', u.top_apps || []);
+      renderBars('topTags', u.top_tags || []);
+      renderBars('dailyClips', (u.daily_counts || []).map(d => ({name: d.day, count: d.count})));
+    }
     async function loadTags() {
       const r = await fetch('/tags');
       const data = await r.json();
@@ -4040,6 +4297,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         const r = await fetch('/status');
         if (!r.ok) return;
         const s = await r.json();
+        renderDashboard(s);
         const paused = !!s.paused;
         const maxMb = s.max_db_mb || 0;
         const usedMb = s.db_size_mb || 0;
@@ -4117,6 +4375,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
       if (!enabled || !seconds || seconds <= 0) return;
       autoTimer = setInterval(() => {
         if (document.visibilityState === 'hidden') return;
+        loadStatus();
         if (lastMode === 'search') return;
         if (lastMode === 'topics') {
           loadTopics();
@@ -4294,6 +4553,9 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             s = stats(conn)
             s["db_size_mb"] = round(s["db_size_bytes"] / (1024 * 1024), 3)
             self._send(200, s)
+            return
+        if path == "/usage":
+            self._send(200, usage_snapshot(conn))
             return
         if path == "/recent":
             limit = int(qs.get("limit", [10])[0])
