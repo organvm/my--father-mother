@@ -238,6 +238,42 @@ class TestGumroadLicenseHelpers:
         assert mfm.is_pro_enabled(conn) is False
 
 
+class TestLicenseUtilities:
+    def test_mask_secret(self):
+        assert mfm.mask_secret("") == ""
+        assert mfm.mask_secret("short") == "***"
+        assert mfm.mask_secret("LIC-1234567890") == "LIC-...7890"
+
+    def test_upgrade_url_defaults_and_empty_fallback(self, conn):
+        assert mfm.get_upgrade_url(conn) == mfm.DEFAULT_UPGRADE_URL
+        mfm.set_setting(conn, "upgrade_url", "")
+        assert mfm.get_upgrade_url(conn) == mfm.DEFAULT_UPGRADE_URL
+        mfm.set_setting(conn, "upgrade_url", "https://example.test/upgrade")
+        assert mfm.get_upgrade_url(conn) == "https://example.test/upgrade"
+
+    def test_pro_required_message(self, conn):
+        ok, msg = mfm.pro_required("semantic search", conn)
+        assert ok is False
+        assert "requires Pro" in msg
+
+        mfm.set_pro_enabled(conn, True)
+        ok, msg = mfm.pro_required("semantic search", conn)
+        assert ok is True
+        assert msg == ""
+
+
+class TestGumroadWebhookSecret:
+    def test_reads_setting_when_env_missing(self, conn, monkeypatch):
+        monkeypatch.delenv("GUMROAD_WEBHOOK_SECRET", raising=False)
+        mfm.set_setting(conn, "gumroad_webhook_secret", "db-secret")
+        assert mfm.gumroad_webhook_secret(conn) == "db-secret"
+
+    def test_env_overrides_setting(self, conn, monkeypatch):
+        mfm.set_setting(conn, "gumroad_webhook_secret", "db-secret")
+        monkeypatch.setenv("GUMROAD_WEBHOOK_SECRET", "env-secret")
+        assert mfm.gumroad_webhook_secret(conn) == "env-secret"
+
+
 class TestBoolSettings:
     def test_get_default_true(self, conn):
         assert mfm.get_bool_setting(conn, "flag", True) is True
@@ -531,6 +567,21 @@ class TestParseIsoDt:
         assert result is not None
 
 
+class TestAutoContextFlags:
+    def test_off_disables_summary_and_tags(self):
+        assert mfm.auto_context_flags("off") == (False, False)
+        assert mfm.auto_context_flags("disabled") == (False, False)
+
+    def test_low_allows_summary_only(self):
+        assert mfm.auto_context_flags("low") == (True, False)
+        assert mfm.auto_context_flags("lite") == (True, False)
+
+    def test_medium_high_and_unknown_allow_both(self):
+        assert mfm.auto_context_flags("medium") == (True, True)
+        assert mfm.auto_context_flags("high") == (True, True)
+        assert mfm.auto_context_flags("unexpected") == (True, True)
+
+
 class TestIsoHoursAgo:
     def test_none_returns_none(self):
         assert mfm.iso_hours_ago(None) is None
@@ -567,6 +618,48 @@ class TestResolveSyncTarget:
         assert result == icloud_dir / "mfm.db"
 
 
+class TestSyncPull:
+    def test_missing_source(self, tmp_path):
+        ok, msg = mfm.sync_pull(str(tmp_path / "missing.db"))
+        assert ok is False
+        assert "source not found" in msg
+
+    def test_copies_source_and_backs_up_existing_db(self, tmp_path, monkeypatch):
+        local_dir = tmp_path / "local"
+        local_db = local_dir / "mfm.db"
+        remote_dir = tmp_path / "remote"
+        remote_db = remote_dir / "mfm.db"
+        local_dir.mkdir()
+        remote_dir.mkdir()
+        monkeypatch.setattr(mfm, "DB_DIR", local_dir)
+        monkeypatch.setattr(mfm, "DB_PATH", local_db)
+
+        local = sqlite3.connect(local_db)
+        local.row_factory = sqlite3.Row
+        mfm.init_db(local)
+        mfm.insert_clip(local, "local content", "LocalApp", "Win")
+        local.close()
+
+        remote = sqlite3.connect(remote_db)
+        remote.row_factory = sqlite3.Row
+        mfm.init_db(remote)
+        mfm.insert_clip(remote, "remote content", "RemoteApp", "Win")
+        remote.close()
+
+        ok, msg = mfm.sync_pull(str(remote_db))
+
+        assert ok is True
+        assert "pulled db" in msg
+        pulled = sqlite3.connect(local_db)
+        backup = sqlite3.connect(local_db.with_suffix(".bak"))
+        try:
+            assert pulled.execute("SELECT content FROM clips").fetchone()[0] == "remote content"
+            assert backup.execute("SELECT content FROM clips").fetchone()[0] == "local content"
+        finally:
+            pulled.close()
+            backup.close()
+
+
 class TestSyncPush:
     def test_icloud_push_writes_sqlite_snapshot(self, conn, tmp_path, monkeypatch):
         icloud_dir = tmp_path / "CloudDocs"
@@ -583,6 +676,46 @@ class TestSyncPush:
         finally:
             synced.close()
         assert count == 1
+
+
+class TestMaybeWatchSync:
+    def test_no_target_noops(self, conn):
+        last_at, last_target = mfm.maybe_watch_sync(conn, 10.0, "previous")
+        assert last_at == 10.0
+        assert last_target == ""
+
+    def test_pushes_when_target_configured(self, conn, monkeypatch):
+        calls = []
+        mfm.set_setting(conn, "sync_target", "icloud")
+        monkeypatch.setattr(mfm.time, "monotonic", lambda: 123.0)
+        monkeypatch.setattr(mfm, "say", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            mfm,
+            "sync_push",
+            lambda target, source_conn=None: calls.append((target, source_conn is conn)) or (True, "ok"),
+        )
+
+        last_at, last_target = mfm.maybe_watch_sync(conn, None, "")
+
+        assert calls == [("icloud", True)]
+        assert last_at == 123.0
+        assert last_target == "icloud"
+
+    def test_waits_until_interval_elapsed(self, conn, monkeypatch):
+        calls = []
+        mfm.set_setting(conn, "sync_target", "icloud")
+        monkeypatch.setattr(mfm.time, "monotonic", lambda: 120.0)
+        monkeypatch.setattr(
+            mfm,
+            "sync_push",
+            lambda target, source_conn=None: calls.append(target) or (True, "ok"),
+        )
+
+        last_at, last_target = mfm.maybe_watch_sync(conn, 100.0, "icloud")
+
+        assert calls == []
+        assert last_at == 100.0
+        assert last_target == "icloud"
 
 
 class TestStats:
@@ -602,6 +735,18 @@ class TestMaxBytes:
 
     def test_override(self, conn):
         assert mfm.get_max_bytes(conn, 32768) == 32768
+
+
+class TestMaxDbMb:
+    def test_default(self, conn):
+        assert mfm.get_max_db_mb(conn, None) == mfm.DEFAULT_MAX_DB_MB
+
+    def test_override(self, conn):
+        assert mfm.get_max_db_mb(conn, 128) == 128
+
+    def test_invalid_setting_uses_default(self, conn):
+        mfm.set_setting(conn, "max_db_mb", "bad")
+        assert mfm.get_max_db_mb(conn, None) == mfm.DEFAULT_MAX_DB_MB
 
 
 class TestEvictMode:
@@ -988,6 +1133,55 @@ class TestIngestText:
         assert mfm.ingest_text(conn, "", "App", "Win") is None
 
 
+class TestIngestFileAtPath:
+    def test_ingests_allowed_text_file_with_metadata_and_tags(self, conn, tmp_path):
+        path = tmp_path / "note.md"
+        path.write_text("file body", encoding="utf-8")
+
+        cid = mfm.ingest_file_at_path(
+            conn,
+            path,
+            max_bytes=mfm.DEFAULT_MAX_BYTES,
+            allow_secrets=False,
+            tags=["inbox-tag"],
+        )
+
+        assert cid is not None
+        row = mfm.fetch_clip(conn, cid)
+        assert row["source_app"] == "inbox"
+        assert row["title"] == "note.md"
+        assert row["file_path"] == str(path)
+        assert "inbox-tag" in mfm.tags_for_clip(conn, cid)
+
+    def test_rejects_unsupported_extension(self, conn, tmp_path):
+        path = tmp_path / "blob.bin"
+        path.write_text("binary-ish", encoding="utf-8")
+
+        assert mfm.ingest_file_at_path(conn, path, mfm.DEFAULT_MAX_BYTES, True) is None
+        assert conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0] == 0
+
+    def test_rejects_secret_like_file_when_disallowed(self, conn, tmp_path):
+        path = tmp_path / "secret.txt"
+        path.write_text("key: AKIAIOSFODNN7EXAMPLE", encoding="utf-8")  # allow-secret
+
+        assert mfm.ingest_file_at_path(conn, path, mfm.DEFAULT_MAX_BYTES, False) is None
+        assert conn.execute("SELECT COUNT(*) FROM clips").fetchone()[0] == 0
+
+
+class TestIngestTranscript:
+    def test_ingests_and_tags_transcript(self, conn, tmp_path):
+        path = tmp_path / "standup.txt"
+        path.write_text("Alice: status update", encoding="utf-8")
+
+        cid = mfm.ingest_transcript(conn, path, mfm.DEFAULT_MAX_BYTES, False, tags=["team"])
+
+        assert cid is not None
+        row = mfm.fetch_clip(conn, cid)
+        assert row["source_app"] == "meeting"
+        assert row["title"] == "standup.txt"
+        assert {"meeting", "transcript", "team"}.issubset(set(mfm.tags_for_clip(conn, cid)))
+
+
 class TestImportClips:
     def test_imports_multiple(self, conn):
         items = [
@@ -1189,6 +1383,40 @@ class TestBuildAnnIndex:
         assert vecs == [[0.1, 0.2, 0.3]]
 
 
+class TestFetchSemanticCandidates:
+    def test_filters_by_app_tag_pin_and_time(self, conn):
+        keep = mfm.insert_clip(conn, "alpha project", "Terminal", "Win")
+        other = mfm.insert_clip(conn, "beta project", "VSCode", "Win")
+        conn.execute("UPDATE clips SET created_at = ? WHERE id = ?", ("2026-01-02T00:00:00+00:00", keep))
+        conn.execute("UPDATE clips SET created_at = ? WHERE id = ?", ("2026-01-04T00:00:00+00:00", other))
+        conn.execute("UPDATE clips SET pinned = 1 WHERE id = ?", (keep,))
+        conn.commit()
+        mfm.assign_tag(conn, keep, "focus")
+        mfm.assign_tag(conn, other, "focus")
+
+        rows = mfm.fetch_semantic_candidates(
+            conn,
+            app="terminal",
+            tag="focus",
+            limit=10,
+            model="hash",
+            since_iso="2026-01-01T00:00:00+00:00",
+            until_iso="2026-01-03T00:00:00+00:00",
+            pins_only=True,
+        )
+
+        assert [row["id"] for row in rows] == [keep]
+        assert rows[0]["model"] == "hash"
+
+    def test_model_filter_excludes_other_embeddings(self, conn):
+        cid = mfm.insert_clip(conn, "semantic candidate", "App", "Win")
+        mfm.store_embedding(conn, cid, [0.1, 0.2], "custom-model")
+
+        rows = mfm.fetch_semantic_candidates(conn, None, None, 10, "hash")
+
+        assert rows == []
+
+
 # ──────────────────────────────────────────────
 # Topic groups
 # ──────────────────────────────────────────────
@@ -1302,6 +1530,87 @@ class TestCommandExists:
 
     def test_unknown_command(self):
         assert mfm.command_exists("this-command-does-not-exist-42") is False
+
+
+class TestRunHelper:
+    def test_returns_stripped_stdout(self):
+        assert mfm.run_helper("cat", "hello\n") == "hello"
+
+    def test_returns_none_on_nonzero_exit(self):
+        assert mfm.run_helper("exit 7", "hello") is None
+
+
+class TestRunUserHelperOnClip:
+    def test_requires_configured_helper(self, conn):
+        cid = mfm.insert_clip(conn, "hello helper", "App", "Win")
+
+        ok, msg, new_id, out = mfm.run_user_helper_on_clip(conn, "rewrite", cid)
+
+        assert ok is False
+        assert "configure helper_rewrite_cmd" in msg
+        assert new_id is None
+        assert out is None
+
+    def test_saves_helper_output_and_tags_it(self, conn):
+        cid = mfm.insert_clip(conn, "hello helper", "App", "Win")
+        mfm.set_setting(conn, "helper_rewrite_cmd", "tr a-z A-Z")
+
+        ok, msg, new_id, out = mfm.run_user_helper_on_clip(conn, "rewrite", cid)
+
+        assert ok is True
+        assert f"saved rewrite of #{cid}" in msg
+        assert new_id is not None
+        assert out == "HELLO HELPER"
+        row = mfm.fetch_clip(conn, new_id)
+        assert row["content"] == "HELLO HELPER"
+        assert {"rewrite", f"from:{cid}"}.issubset(set(mfm.tags_for_clip(conn, new_id)))
+
+
+class TestRunAiHelper:
+    def test_requires_configured_command(self, conn):
+        ok, msg, new_id, out = mfm.run_ai_helper(conn, "ai_recall_cmd", None, 10, 1.0, False, "recall")
+
+        assert ok is False
+        assert "configure ai_recall_cmd" in msg
+        assert new_id is None
+        assert out is None
+
+    def test_reports_no_clips(self, conn):
+        mfm.set_setting(conn, "ai_recall_cmd", "cat")
+
+        ok, msg, new_id, out = mfm.run_ai_helper(conn, "ai_recall_cmd", None, 10, 1.0, False, "recall")
+
+        assert ok is False
+        assert msg == "no clips available"
+        assert new_id is None
+        assert out is None
+
+    def test_saves_output_when_requested(self, conn):
+        original_id = mfm.insert_clip(conn, "source memory", "App", "Win")
+        mfm.assign_tag(conn, original_id, "source")
+        mfm.set_setting(conn, "ai_recall_cmd", "printf 'recall summary\\nbody\\n'")
+
+        ok, msg, new_id, out = mfm.run_ai_helper(conn, "ai_recall_cmd", None, 10, 1.0, True, "recall")
+
+        assert ok is True
+        assert msg == "helper output ok"
+        assert new_id is not None
+        assert out == "recall summary\nbody"
+        row = mfm.fetch_clip(conn, new_id)
+        assert row["title"] == "recall summary"
+        assert {"recall", "helper:ai_recall_cmd"}.issubset(set(mfm.tags_for_clip(conn, new_id)))
+
+
+class TestMcpBaseUrl:
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv("MFM_MCP_HOST", raising=False)
+        monkeypatch.delenv("MFM_MCP_PORT", raising=False)
+        assert mfm.mcp_base_url() == "http://127.0.0.1:39300"
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("MFM_MCP_HOST", "0.0.0.0")
+        monkeypatch.setenv("MFM_MCP_PORT", "9999")
+        assert mfm.mcp_base_url() == "http://0.0.0.0:9999"
 
 
 class TestCopyToClipboard:
