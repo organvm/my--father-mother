@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -50,23 +49,6 @@ DEFAULT_UI_METRICS = "default"
 DEFAULT_UI_TOOLBAR = "suggested"
 DEFAULT_PERSONAL_CLOUD_STATUS = "disconnected"
 
-# --- License / Billing ---
-LEMON_SQUEEZY_STORE_ID = "my-father-mother"
-LEMON_SQUEEZY_VARIANT_ID = "premium"
-LEMON_SQUEEZY_CHECKOUT_URL = (
-    "https://my-father-mother.lemonsqueezy.com/checkout/buy/"
-)
-LICENSE_API_URL = "https://api.lemonsqueezy.com/v1/licenses/activate"
-PREMIUM_FEATURES = [
-    "semantic-search",
-    "ai-recall",
-    "ai-fill",
-    "copilot-chats",
-    "cloud-backup",
-    "ml-engine",
-    "federation",
-]
-
 DEFAULT_MAX_BYTES = 16_384  # ~16 KB
 DEFAULT_NOTIFY = False
 DEFAULT_WATCH_SYNC_INTERVAL = 60.0
@@ -76,8 +58,6 @@ EMBED_DIM = 128
 DEFAULT_EVICT_MODE = "fifo"  # fifo|tiered
 DEFAULT_ALLOW_PDF = False
 DEFAULT_ALLOW_IMAGES = False
-DEFAULT_UPGRADE_URL = "https://gumroad.com/l/my-father-mother-pro"
-GUMROAD_VERIFY_URL = "https://api.gumroad.com/v2/licenses/verify"
 ALLOWED_EXTS = {
     ".txt",
     ".md",
@@ -630,139 +610,12 @@ def stats(conn: sqlite3.Connection) -> dict:
     }
 
 
-def usage_snapshot(conn: sqlite3.Connection, top_limit: int = 5, days: int = 7) -> dict:
-    top_limit = max(1, min(int(top_limit), 20))
-    days = max(1, min(int(days), 31))
-    base = stats(conn)
-
-    def count_value(sql: str, params: tuple = ()) -> int:
-        row = conn.execute(sql, params).fetchone()
-        return int(row[0] or 0) if row else 0
-
-    total_clips = int(base.get("count") or 0)
-    first_row = conn.execute("SELECT MIN(created_at) AS first FROM clips").fetchone()
-    size_row = conn.execute(
-        """
-        SELECT
-            COALESCE(SUM(LENGTH(content)), 0) AS content_chars,
-            COALESCE(AVG(LENGTH(content)), 0) AS avg_clip_chars
-        FROM clips
-        """
-    ).fetchone()
-    db_size_bytes = int(base.get("db_size_bytes") or 0)
-    db_size_mb = round(db_size_bytes / (1024 * 1024), 3)
-    max_db_mb = get_max_db_mb(conn, None)
-    storage_pct = round((db_size_mb / max_db_mb) * 100, 1) if max_db_mb else None
-
-    top_apps = [
-        {
-            "name": row["name"],
-            "count": row["clip_count"],
-            "latest": row["latest"],
-        }
-        for row in conn.execute(
-            """
-            SELECT
-                COALESCE(NULLIF(source_app, ''), 'unknown') AS name,
-                COUNT(*) AS clip_count,
-                MAX(created_at) AS latest
-            FROM clips
-            GROUP BY COALESCE(NULLIF(source_app, ''), 'unknown')
-            ORDER BY clip_count DESC, latest DESC
-            LIMIT ?
-            """,
-            (top_limit,),
-        ).fetchall()
-    ]
-    top_tags = [
-        {
-            "name": row["name"],
-            "count": row["clip_count"],
-            "latest": row["latest"],
-        }
-        for row in conn.execute(
-            """
-            SELECT t.name, COUNT(ct.clip_id) AS clip_count, MAX(c.created_at) AS latest
-            FROM tags t
-            JOIN clip_tags ct ON ct.tag_id = t.id
-            JOIN clips c ON c.id = ct.clip_id
-            GROUP BY t.id, t.name
-            ORDER BY clip_count DESC, latest DESC
-            LIMIT ?
-            """,
-            (top_limit,),
-        ).fetchall()
-    ]
-    daily_counts = [
-        {"day": row["day"], "count": row["clip_count"]}
-        for row in conn.execute(
-            """
-            SELECT date(created_at) AS day, COUNT(*) AS clip_count
-            FROM clips
-            WHERE datetime(created_at) >= datetime('now', ?)
-            GROUP BY date(created_at)
-            ORDER BY day ASC
-            """,
-            (f"-{days} days",),
-        ).fetchall()
-    ]
-    embedding_models = [
-        {"model": row["model"], "count": row["clip_count"]}
-        for row in conn.execute(
-            """
-            SELECT model, COUNT(*) AS clip_count
-            FROM clip_vectors
-            GROUP BY model
-            ORDER BY clip_count DESC, model ASC
-            """
-        ).fetchall()
-    ]
-    vector_count = sum(item["count"] for item in embedding_models)
-    vector_coverage = round((vector_count / total_clips) * 100, 1) if total_clips else 0.0
-
-    return {
-        "total_clips": total_clips,
-        "pinned_clips": count_value("SELECT COUNT(*) FROM clips WHERE pinned = 1"),
-        "tagged_clips": count_value("SELECT COUNT(DISTINCT clip_id) FROM clip_tags"),
-        "tag_count": count_value("SELECT COUNT(*) FROM tags"),
-        "note_count": count_value("SELECT COUNT(*) FROM clip_notes"),
-        "repeat_events": count_value("SELECT COUNT(*) FROM clip_events"),
-        "clips_last_24h": count_value(
-            "SELECT COUNT(*) FROM clips WHERE datetime(created_at) >= datetime('now', '-1 day')"
-        ),
-        "clips_last_7d": count_value(
-            "SELECT COUNT(*) FROM clips WHERE datetime(created_at) >= datetime('now', '-7 days')"
-        ),
-        "events_last_24h": count_value(
-            "SELECT COUNT(*) FROM clip_events WHERE datetime(seen_at) >= datetime('now', '-1 day')"
-        ),
-        "first_clip_at": first_row["first"] if first_row else None,
-        "latest_clip_at": base.get("latest"),
-        "content_chars": int(size_row["content_chars"] or 0) if size_row else 0,
-        "average_clip_chars": round(float(size_row["avg_clip_chars"] or 0), 1) if size_row else 0.0,
-        "storage": {
-            "db_size_bytes": db_size_bytes,
-            "db_size_mb": db_size_mb,
-            "max_db_mb": max_db_mb,
-            "used_pct": storage_pct,
-        },
-        "vector_count": vector_count,
-        "vector_coverage_pct": vector_coverage,
-        "embedding_models": embedding_models,
-        "top_apps": top_apps,
-        "top_tags": top_tags,
-        "daily_counts": daily_counts,
-    }
-
-
 def status_snapshot(conn: sqlite3.Connection) -> dict:
-    usage = usage_snapshot(conn)
-    license_info = license_snapshot(conn)
+    s = stats(conn)
     return {
         "paused": is_paused(conn),
         "allow_secrets": get_allow_secrets(conn, None),
         "notify": get_notify(conn, None),
-        "pro_enabled": license_info["pro_enabled"],
         "embedder": get_embedder(conn, None),
         "max_bytes": get_max_bytes(conn, None),
         "max_db_mb": get_max_db_mb(conn, None),
@@ -772,18 +625,12 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "ltm_enabled": get_bool_setting(conn, "ltm_enabled", DEFAULT_LTM_ENABLED),
         "ml_context_level": get_setting(conn, "ml_context_level", DEFAULT_ML_CONTEXT_LEVEL),
         "ml_processing_mode": get_setting(conn, "ml_processing_mode", DEFAULT_ML_PROCESSING_MODE),
-        "count": usage["total_clips"],
-        "latest": usage["latest_clip_at"],
-        "db_size_mb": usage["storage"]["db_size_mb"],
+        "count": s.get("count", 0),
+        "latest": s.get("latest"),
+        "db_size_mb": round((s.get("db_size_bytes", 0) or 0) / (1024 * 1024), 3),
         "blocklist_size": len(get_blocklist(conn)),
         "sync_target": get_setting(conn, "sync_target", ""),
         "sync_interval": get_sync_interval(conn),
-        "license_type": license_info["license_type"],
-        "license_status": license_info["license_status"],
-        "has_license_key": license_info["has_license_key"],
-        "device_count": license_info["device_count"],
-        "upgrade_url": license_info["upgrade_url"],
-        "usage": usage,
     }
 
 
@@ -897,172 +744,6 @@ def set_bool_setting(conn: sqlite3.Connection, key: str, value: bool) -> None:
     set_setting(conn, key, "1" if value else "0")
 
 
-def get_license_key(conn: sqlite3.Connection) -> str:
-    """Return the configured Pro license key, supporting the public alias."""
-    return (
-        get_setting(conn, "gumroad_license_key", "").strip()
-        or get_setting(conn, "license_key", "").strip()
-    )
-
-
-def mask_secret(value: str) -> str:
-    clean = (value or "").strip()
-    if not clean:
-        return ""
-    if len(clean) <= 8:
-        return "***"
-    return f"{clean[:4]}...{clean[-4:]}"
-
-
-def set_license_key(conn: sqlite3.Connection, value: str) -> None:
-    clean = (value or "").strip()
-    set_setting(conn, "gumroad_license_key", clean)
-    set_setting(conn, "license_key", clean)
-    if clean:
-        set_bool_setting(conn, "pro_enabled", True)
-        set_setting(conn, "license_type", "pro")
-        set_setting(conn, "license_status", "active")
-        set_setting(conn, "license_updated_at", datetime.now(timezone.utc).isoformat())
-    else:
-        set_bool_setting(conn, "pro_enabled", False)
-        set_setting(conn, "license_type", "free")
-        set_setting(conn, "license_status", "inactive")
-        set_setting(conn, "license_updated_at", datetime.now(timezone.utc).isoformat())
-
-
-def is_pro_enabled(conn: sqlite3.Connection) -> bool:
-    raw = get_setting(conn, "pro_enabled", "").strip()
-    if raw:
-        parsed = parse_bool_value(raw)
-        if parsed is not None:
-            return parsed
-    return bool(get_license_key(conn))
-
-
-def set_pro_enabled(conn: sqlite3.Connection, enabled: bool) -> None:
-    set_bool_setting(conn, "pro_enabled", enabled)
-    set_setting(conn, "license_type", "pro" if enabled else "free")
-    if not enabled:
-        set_setting(conn, "license_status", "inactive")
-
-
-def get_upgrade_url(conn: sqlite3.Connection) -> str:
-    return get_setting(conn, "upgrade_url", DEFAULT_UPGRADE_URL).strip() or DEFAULT_UPGRADE_URL
-
-
-def license_snapshot(conn: sqlite3.Connection) -> dict:
-    enabled = is_pro_enabled(conn)
-    key = get_license_key(conn)
-    return {
-        "pro_enabled": enabled,
-        "license_type": "pro" if enabled else "free",
-        "license_status": get_setting(conn, "license_status", "active" if enabled else "inactive"),
-        "license_key": mask_secret(key),
-        "has_license_key": bool(key),
-        "email": get_setting(conn, "gumroad_email", ""),
-        "device_count": 1 if enabled else 0,
-        "upgrade_url": get_upgrade_url(conn),
-    }
-
-
-def pro_required(feature: str, conn: sqlite3.Connection) -> tuple[bool, str]:
-    if is_pro_enabled(conn):
-        return True, ""
-    return False, f"{feature} requires Pro. Activate with `config --set license_key YOUR_KEY`."
-
-
-def resolve_embedder_for_use(
-    conn: sqlite3.Connection,
-    override: Optional[str],
-) -> tuple[str, Optional[str]]:
-    kind = get_embedder(conn, override)
-    if kind == "e5-small" and not is_pro_enabled(conn):
-        return "hash", "e5-small embeddings require Pro; using hash similarity"
-    return kind, None
-
-
-def gumroad_webhook_secret(conn: sqlite3.Connection) -> str:
-    return os.environ.get("GUMROAD_WEBHOOK_SECRET", "").strip() or get_setting(
-        conn, "gumroad_webhook_secret", ""
-    ).strip()
-
-
-def verify_gumroad_signature(body: bytes, signature: str, secret: str) -> bool:
-    sig = (signature or "").strip()
-    if sig.startswith("sha256="):
-        sig = sig.split("=", 1)[1].strip()
-    if not sig or not secret:
-        return False
-    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, sig)
-
-
-def parse_gumroad_payload(body: bytes, content_type: str) -> dict:
-    ctype = (content_type or "").split(";", 1)[0].strip().lower()
-    text = body.decode("utf-8", errors="ignore")
-    if ctype == "application/json":
-        try:
-            data = json.loads(text)
-            return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {}
-    parsed = urllib.parse.parse_qs(text, keep_blank_values=True)
-    return {key: vals[-1] if vals else "" for key, vals in parsed.items()}
-
-
-def validate_gumroad_license(conn: sqlite3.Connection, license_key: str) -> Optional[bool]:
-    permalink = get_setting(conn, "gumroad_permalink", "").strip()
-    if not permalink or not license_key:
-        return None
-    payload = urllib.parse.urlencode(
-        {
-            "product_permalink": permalink,
-            "license_key": license_key,
-            "increment_uses_count": "false",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        GUMROAD_VERIFY_URL,
-        data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=4.0) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-    except Exception:
-        return None
-    if not data.get("success"):
-        return False
-    purchase = data.get("purchase") or {}
-    blocked = any(
-        bool(purchase.get(flag))
-        for flag in ("refunded", "chargebacked", "disputed", "subscription_cancelled")
-    )
-    return not blocked
-
-
-def apply_gumroad_license_event(conn: sqlite3.Connection, payload: dict) -> tuple[bool, str, Optional[bool]]:
-    license_key = str(payload.get("license_key") or "").strip()
-    if not license_key:
-        return False, "missing license_key", None
-    for payload_key, setting_key in (
-        ("email", "gumroad_email"),
-        ("product_permalink", "gumroad_permalink"),
-        ("sale_id", "gumroad_sale_id"),
-        ("product_id", "gumroad_product_id"),
-    ):
-        val = str(payload.get(payload_key) or "").strip()
-        if val:
-            set_setting(conn, setting_key, val)
-    valid = validate_gumroad_license(conn, license_key)
-    if valid is False:
-        set_setting(conn, "license_status", "invalid")
-        return False, "license verification failed", valid
-    set_license_key(conn, license_key)
-    set_setting(conn, "license_status", "active" if valid is not False else "pending")
-    return True, "license stored", valid
-
-
 SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "account_email": ("str", ""),
     "account_avatar": ("str", ""),
@@ -1089,9 +770,6 @@ SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "ui_font_weight": ("str", DEFAULT_UI_FONT_WEIGHT),
     "ui_density": ("str", DEFAULT_UI_DENSITY),
     "telemetry_enabled": ("bool", False),
-    "license_key": ("str", ""),
-    "license_verified_at": ("str", ""),
-    "license_tier": ("str", "free"),
 }
 
 CONNECTED_APPS = [
@@ -1162,18 +840,13 @@ def mcp_base_url() -> str:
 
 def settings_snapshot(conn: sqlite3.Connection) -> dict:
     base = mcp_base_url()
-    license_info = license_snapshot(conn)
     return {
         "account": {
             "email": get_setting_typed(conn, "account_email"),
             "avatar": get_setting_typed(conn, "account_avatar"),
             "linked_accounts": get_setting_typed(conn, "account_linked"),
             "organizations": get_setting_typed(conn, "account_orgs"),
-            "upgrade_url": license_info["upgrade_url"],
-            "pro_enabled": license_info["pro_enabled"],
-            "license_type": license_info["license_type"],
-            "license_status": license_info["license_status"],
-            "has_license_key": license_info["has_license_key"],
+            "upgrade_url": get_setting_typed(conn, "account_upgrade_url"),
         },
         "personal_cloud": {
             "status": get_setting_typed(conn, "personal_cloud_status"),
@@ -1231,58 +904,7 @@ def settings_snapshot(conn: sqlite3.Connection) -> dict:
             "mcp_host": os.environ.get("MFM_MCP_HOST", "127.0.0.1"),
             "mcp_port": os.environ.get("MFM_MCP_PORT", "39300"),
         },
-        "license": {
-            "tier": get_setting_typed(conn, "license_tier"),
-            "key_summary": _license_key_summary(get_setting_typed(conn, "license_key")),
-            "verified_at": get_setting_typed(conn, "license_verified_at"),
-            "checkout_url": LEMON_SQUEEZY_CHECKOUT_URL,
-        },
     }
-
-
-# --- License / Billing helpers ---
-def _license_key_summary(key: str) -> str:
-    if not key:
-        return ""
-    if len(key) <= 8:
-        return key
-    return key[:4] + "..." + key[-4:]
-
-
-def verify_license_online(license_key: str) -> tuple[bool, str]:
-    """Verify a license key against Lemon Squeezy API (best-effort)."""
-    import urllib.request as ureq
-    payload = json.dumps({
-        "license_key": license_key,
-        "instance_name": platform.node() or "unknown",
-    }).encode("utf-8")
-    try:
-        req = ureq.Request(
-            LICENSE_API_URL,
-            data=payload,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-            method="POST",
-        )
-        with ureq.urlopen(req, timeout=10) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        if body.get("activated"):
-            return True, "verified"
-        return False, body.get("error", "activation failed")
-    except Exception as e:
-        return False, f"verification failed: {e}"
-
-
-def has_premium(conn: sqlite3.Connection) -> bool:
-    tier = get_setting_typed(conn, "license_tier")
-    return tier == "premium"
-
-
-def require_premium(conn: sqlite3.Connection, feature: str = "") -> bool:
-    if has_premium(conn):
-        return True
-    feature_note = f" ({feature})" if feature else ""
-    say(MOTHER, f"premium feature required{feature_note}. Use `license --activate KEY` or buy at {LEMON_SQUEEZY_CHECKOUT_URL}")
-    return False
 
 
 def format_setting_value(value) -> str:
@@ -1545,7 +1167,7 @@ def embed_from_kind(kind: str, text: str) -> tuple[list[float], str]:
 
 
 def embed_text(conn: sqlite3.Connection, text: str, embedder_override: Optional[str] = None) -> tuple[list[float], str]:
-    kind, _warning = resolve_embedder_for_use(conn, embedder_override)
+    kind = get_embedder(conn, embedder_override)
     return embed_from_kind(kind, text)
 
 
@@ -1965,9 +1587,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     notify_override: Optional[bool] = True if args.notify else False if args.no_notify else None
     notify_enabled = get_notify(conn, notify_override)
-    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
-    if embedder_warning:
-        say(FATHER, embedder_warning)
+    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
     cap_by_app = get_cap_map(conn, "cap_by_app")
     auto_summary_cmd = get_setting(conn, "auto_summary_cmd", "").strip()
     auto_tag_cmd = get_setting(conn, "auto_tag_cmd", "").strip()
@@ -2001,9 +1621,6 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 ltm_enabled = get_bool_setting(conn, "ltm_enabled", DEFAULT_LTM_ENABLED)
                 allow_summary, allow_tags = auto_context_flags(context_level)
                 if not ltm_enabled:
-                    allow_summary = False
-                    allow_tags = False
-                if not is_pro_enabled(conn):
                     allow_summary = False
                     allow_tags = False
                 digest = hashlib.sha256(clip.encode("utf-8")).hexdigest()
@@ -2351,12 +1968,7 @@ def fetch_semantic_candidates(
 def cmd_semantic_search(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "semantic-search"):
-        return
-    embedder_kind, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
-    if embedder_warning:
-        say(FATHER, embedder_warning)
-    qvec, model_used = embed_from_kind(embedder_kind, args.query)
+    qvec, model_used = embed_from_kind(get_embedder(conn, getattr(args, "embedder", None)), args.query)
     since_iso = parse_iso_dt(args.since) if getattr(args, "since", None) else None
     if getattr(args, "since_hours", None) is not None:
         since_iso = iso_hours_ago(args.since_hours)
@@ -2421,7 +2033,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     latest = snap["latest"] or "n/a"
     say(
         FATHER,
-        f"capture={'paused' if snap['paused'] else 'active'}, tier={snap['license_type']}, pro_enabled={snap['pro_enabled']}, license_status={snap['license_status']}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
+        f"capture={'paused' if snap['paused'] else 'active'}, notify={snap['notify']}, allow_secrets={snap['allow_secrets']}, embedder={snap['embedder']}, "
         f"ltm={snap['ltm_enabled']}, ml_context={snap['ml_context_level']}, ml_mode={snap['ml_processing_mode']}, "
         f"max_bytes={snap['max_bytes']}, max_db_mb={snap['max_db_mb']}, evict_mode={snap['evict_mode']}, clips={snap['count']}, latest={latest}, db={snap['db_size_mb']:.2f} MB, blocklisted_apps={snap['blocklist_size']}, cap_by_app={snap['cap_by_app']}, cap_by_tag={snap['cap_by_tag']}",
     )
@@ -2471,10 +2083,6 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, f"  linked_accounts={format_setting_value(account.get('linked_accounts'))}")
     say(FATHER, f"  organizations={format_setting_value(account.get('organizations'))}")
     say(FATHER, f"  upgrade_url={format_setting_value(account.get('upgrade_url'))}")
-    say(FATHER, f"  pro_enabled={format_setting_value(account.get('pro_enabled'))}")
-    say(FATHER, f"  license_type={format_setting_value(account.get('license_type'))}")
-    say(FATHER, f"  license_status={format_setting_value(account.get('license_status'))}")
-    say(FATHER, f"  has_license_key={format_setting_value(account.get('has_license_key'))}")
 
     cloud = snap["personal_cloud"]
     say(FATHER, "Personal Cloud")
@@ -2526,13 +2134,6 @@ def cmd_settings(args: argparse.Namespace) -> None:
     say(FATHER, f"  font_weight={format_setting_value(aest.get('font_weight'))}")
     say(FATHER, f"  visual_density={format_setting_value(aest.get('visual_density'))}")
 
-    license = snap["license"]
-    say(FATHER, "License")
-    say(FATHER, f"  tier={format_setting_value(license.get('tier'))}")
-    say(FATHER, f"  key={format_setting_value(license.get('key_summary'))}")
-    say(FATHER, f"  verified_at={format_setting_value(license.get('verified_at'))}")
-    say(FATHER, f"  checkout_url={format_setting_value(license.get('checkout_url'))}")
-
     telemetry = snap["telemetry"]
     say(FATHER, "Telemetry")
     say(FATHER, f"  enabled={format_setting_value(telemetry.get('enabled'))}")
@@ -2557,8 +2158,6 @@ def cmd_settings(args: argparse.Namespace) -> None:
 def cmd_copilot(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "copilot-chats"):
-        return
     did_action = False
     if args.set_model:
         set_setting(conn, "copilot_model", args.set_model)
@@ -2626,8 +2225,6 @@ def cmd_copilot(args: argparse.Namespace) -> None:
 def cmd_ml(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "ml-engine"):
-        return
     did_action = False
     if args.context_level:
         set_setting(conn, "ml_context_level", args.context_level)
@@ -2701,43 +2298,6 @@ def cmd_ml(args: argparse.Namespace) -> None:
             FATHER,
             f"auto_context_level={auto_level}, processing_mode={proc_mode}, ltm_enabled={ltm_enabled}, ltm_permissions={perms}, source_blocklist={blocklist}",
         )
-
-
-def cmd_license(args: argparse.Namespace) -> None:
-    conn = connect_db()
-    init_db(conn)
-    if args.activate:
-        key = args.activate.strip()
-        if not key:
-            say(FATHER, "provide a license key")
-            return
-        say(FATHER, "verifying license key...")
-        ok, msg = verify_license_online(key)
-        if ok:
-            set_setting_typed(conn, "license_key", key)
-            set_setting_typed(conn, "license_tier", "premium")
-            set_setting_typed(conn, "license_verified_at", datetime.now(timezone.utc).isoformat())
-            say(FATHER, f"premium license activated — {msg}")
-        else:
-            say(FATHER, f"license activation failed: {msg}")
-        return
-    if args.deactivate:
-        set_setting_typed(conn, "license_key", "")
-        set_setting_typed(conn, "license_tier", "free")
-        set_setting_typed(conn, "license_verified_at", "")
-        say(FATHER, "license deactivated")
-        return
-    if args.checkout_url:
-        say(FATHER, f"checkout: {LEMON_SQUEEZY_CHECKOUT_URL}")
-        return
-    key = get_setting_typed(conn, "license_key")
-    tier = get_setting_typed(conn, "license_tier")
-    verified_at = get_setting_typed(conn, "license_verified_at")
-    say(FATHER, f"tier={tier}")
-    say(FATHER, f"key={_license_key_summary(key) if key else 'not set'}")
-    say(FATHER, f"verified_at={verified_at if verified_at else 'never'}")
-    say(FATHER, f"checkout_url={LEMON_SQUEEZY_CHECKOUT_URL}")
-    say(FATHER, f"premium_features: {', '.join(PREMIUM_FEATURES)}")
 
 
 def cmd_about(args: argparse.Namespace) -> None:
@@ -2910,8 +2470,6 @@ def cmd_export_md(args: argparse.Namespace) -> None:
 def cmd_federate_export(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "federation"):
-        return
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
     items = export_items(conn, args.limit, app=args.app, tag=args.tag, since_iso=since_iso, pins_only=args.pins_only)
     payload = {"items": items}
@@ -2926,8 +2484,6 @@ def cmd_federate_export(args: argparse.Namespace) -> None:
 def cmd_federate_push(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "federation"):
-        return
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
     items = export_items(conn, args.limit, app=args.app, tag=args.tag, since_iso=since_iso, pins_only=args.pins_only)
     payload = json.dumps({"items": items}, ensure_ascii=False).encode("utf-8")
@@ -2960,18 +2516,6 @@ def cmd_config(args: argparse.Namespace) -> None:
         elif key == "embedder":
             val = get_embedder(conn, None)
             say(FATHER, f"embedder={val}")
-        elif key == "pro_enabled":
-            say(FATHER, f"pro_enabled={is_pro_enabled(conn)}")
-        elif key == "license_type":
-            say(FATHER, f"license_type={license_snapshot(conn)['license_type']}")
-        elif key in ("license_key", "gumroad_license_key"):
-            say(FATHER, f"{key}={mask_secret(get_license_key(conn))}")
-        elif key == "gumroad_webhook_secret":
-            say(FATHER, f"gumroad_webhook_secret={'***set***' if gumroad_webhook_secret(conn) else ''}")
-        elif key == "gumroad_permalink":
-            say(FATHER, f"gumroad_permalink={get_setting(conn, 'gumroad_permalink', '')}")
-        elif key == "upgrade_url":
-            say(FATHER, f"upgrade_url={get_upgrade_url(conn)}")
         elif key == "cap_by_app":
             say(FATHER, f"cap_by_app={get_cap_map(conn, 'cap_by_app')}")
         elif key == "cap_by_tag":
@@ -3049,31 +2593,8 @@ def cmd_config(args: argparse.Namespace) -> None:
             else:
                 say(FATHER, "value must be true/false or 1/0")
         elif key == "embedder":
-            requested_embedder = get_embedder(conn, value)
-            if requested_embedder == "e5-small" and not is_pro_enabled(conn):
-                say(FATHER, f"e5-small embeddings require Pro. Upgrade: {get_upgrade_url(conn)}")
-            else:
-                set_embedder(conn, value)
-                say(FATHER, f"set embedder={get_embedder(conn, None)}")
-        elif key == "pro_enabled":
-            parsed = parse_bool_value(value)
-            if parsed is None:
-                say(FATHER, "value must be true/false or 1/0")
-            else:
-                set_pro_enabled(conn, parsed)
-                say(FATHER, f"set pro_enabled={is_pro_enabled(conn)}")
-        elif key in ("license_key", "gumroad_license_key"):
-            set_license_key(conn, value)
-            say(FATHER, f"license stored; pro_enabled={is_pro_enabled(conn)}")
-        elif key == "gumroad_webhook_secret":
-            set_setting(conn, "gumroad_webhook_secret", value)
-            say(FATHER, "set gumroad_webhook_secret (hidden)")
-        elif key == "gumroad_permalink":
-            set_setting(conn, "gumroad_permalink", value)
-            say(FATHER, f"set gumroad_permalink={value}")
-        elif key == "upgrade_url":
-            set_setting(conn, "upgrade_url", value)
-            say(FATHER, f"set upgrade_url={get_upgrade_url(conn)}")
+            set_embedder(conn, value)
+            say(FATHER, f"set embedder={get_embedder(conn, None)}")
         elif key == "cap_by_app":
             try:
                 data = json.loads(value)
@@ -3249,8 +2770,6 @@ def cmd_extract(args: argparse.Namespace) -> None:
 def cmd_recall(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "ai-recall"):
-        return
     ok, msg, new_id, out = run_ai_helper(
         conn,
         "ai_recall_cmd",
@@ -3268,8 +2787,6 @@ def cmd_recall(args: argparse.Namespace) -> None:
 def cmd_fill(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "ai-fill"):
-        return
     ok, msg, new_id, out = run_ai_helper(
         conn,
         "ai_fill_cmd",
@@ -3504,8 +3021,6 @@ def perform_cloud_backup(conn: sqlite3.Connection) -> Tuple[bool, str]:
 def cmd_cloud_backup(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "cloud-backup"):
-        return
     interval = max(60, int(getattr(args, "interval", DEFAULT_BACKUP_INTERVAL) or DEFAULT_BACKUP_INTERVAL))
     if getattr(args, "loop", False):
         say(FATHER, f"cloud-backup loop started (every {interval}s); ctrl-c to stop")
@@ -3828,9 +3343,7 @@ def cmd_ingest_file(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     if args.allow_pdf is not None:
         set_allow_pdf(conn, args.allow_pdf)
-    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
-    if embedder_warning:
-        say(FATHER, embedder_warning)
+    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
     path = Path(args.path).expanduser()
     if not path.exists():
         say(MOTHER, f"path not found: {path}")
@@ -3848,9 +3361,7 @@ def cmd_watch_inbox(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     if args.allow_pdf is not None:
         set_allow_pdf(conn, args.allow_pdf)
-    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
-    if embedder_warning:
-        say(FATHER, embedder_warning)
+    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
     interval = max(1.0, args.interval)
     say(MOTHER, f"watching inbox {inbox_dir} (extensions: {', '.join(sorted(ALLOWED_EXTS))})")
     try:
@@ -3872,9 +3383,7 @@ def cmd_ingest_image(args: argparse.Namespace) -> None:
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
     if args.allow_images:
         set_allow_images(conn, True)
-    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
-    if embedder_warning:
-        say(FATHER, embedder_warning)
+    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
     path = Path(args.path).expanduser()
     if not path.exists():
         say(MOTHER, f"path not found: {path}")
@@ -3889,9 +3398,7 @@ def cmd_ingest_transcript(args: argparse.Namespace) -> None:
     init_db(conn)
     max_bytes = get_max_bytes(conn, args.max_bytes)
     allow_secrets = get_allow_secrets(conn, args.allow_secrets)
-    embedder_choice, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
-    if embedder_warning:
-        say(FATHER, embedder_warning)
+    embedder_choice = get_embedder(conn, getattr(args, "embedder", None))
     path = Path(args.path).expanduser()
     if not path.exists():
         say(MOTHER, f"path not found: {path}")
@@ -3904,8 +3411,6 @@ def cmd_ingest_transcript(args: argparse.Namespace) -> None:
 def cmd_federate_import(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "federation"):
-        return
     items: list[dict] = []
     if args.path:
         src = Path(args.path).expanduser()
@@ -3940,8 +3445,6 @@ def cmd_federate_import(args: argparse.Namespace) -> None:
 def cmd_related(args: argparse.Namespace) -> None:
     conn = connect_db()
     init_db(conn)
-    if not require_premium(conn, "semantic-search"):
-        return
     cur = conn.execute(
         "SELECT vector, model FROM clip_vectors WHERE clip_id = ?",
         (args.id,),
@@ -4077,11 +3580,7 @@ def cmd_palette(args: argparse.Namespace) -> None:
     rows: list[sqlite3.Row] = []
     since_iso = iso_hours_ago(args.since_hours) if getattr(args, "since_hours", None) is not None else None
     if args.semantic and args.query:
-        if not require_premium(conn, "semantic-search"):
-            return
-        embedder_kind, embedder_warning = resolve_embedder_for_use(conn, getattr(args, "embedder", None))
-        if embedder_warning:
-            say(FATHER, embedder_warning)
+        embedder_kind = get_embedder(conn, getattr(args, "embedder", None))
         qvec, model_used = embed_from_kind(embedder_kind, args.query)
         rows_sem = fetch_semantic_candidates(conn, args.app, args.tag, args.limit * 5, model_used, since_iso=since_iso, pins_only=args.pins_only)
         ids, vecs = build_ann_index(rows_sem)
@@ -4206,12 +3705,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
-    def _read_body(self) -> bytes:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0:
-            return b""
-        return self.rfile.read(length)
-
     def log_message(self, format: str, *args) -> None:
         # Quiet by default
         return
@@ -4220,7 +3713,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Gumroad-Signature")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -4228,7 +3721,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(query)
         conn = self.conn
         init_db(conn)
-        if path in ("/", "/ui", "/dashboard"):
+        if path in ("/", "/ui"):
             html = """
 <!doctype html>
 <html>
@@ -4236,9 +3729,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
   <meta charset="utf-8" />
   <title>my--father-mother</title>
   <style>
-    :root { --bg:#0b1021; --panel:#111727; --panel-2:#151d30; --line:#263149; --muted:#8fa4b8; --text:#e8ecf1; --teal:#5eead4; --gold:#f6c453; --warn:#f59e0b; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; background: var(--bg); color: var(--text); }
-    h1 { margin: 0 0 12px; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; background: #0b1021; color: #e8ecf1; }
+    h1 { margin-top: 0; }
     input, button, select { padding: 8px; margin: 4px; border-radius: 4px; border: 1px solid #334; background: #111727; color: #e8ecf1; }
     .result { padding: 8px; margin: 8px 0; border: 1px solid #223; border-radius: 6px; background: #111727; }
     .topic { border-color: #2a3b5e; }
@@ -4255,73 +3747,11 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
     .status.warn { background: #302312; color: #ffc773; border: 1px solid #9b6b1a; }
     .note { background: #182035; border-radius: 4px; padding: 4px 6px; margin: 4px 0; font-size: 12px; color: #cdd7f3; }
     .note small { color: #8aa; }
-    .dashboard { margin: 0 0 16px; }
-    .metrics { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 8px; margin-bottom: 8px; }
-    .metric, .panel { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
-    .metric { min-height: 76px; padding: 10px; box-sizing: border-box; }
-    .metric-label, .panel-title { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0; }
-    .metric strong { display: block; margin-top: 6px; font-size: 24px; line-height: 1.1; color: var(--text); }
-    .metric small { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
-    .dashboard-lower { display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 8px; }
-    .panel { padding: 10px; min-height: 128px; box-sizing: border-box; }
-    .bar-list { margin-top: 8px; }
-    .bar-row { display: grid; grid-template-columns: minmax(72px, 1fr) minmax(80px, 2fr) 44px; gap: 8px; align-items: center; margin: 7px 0; font-size: 13px; }
-    .bar-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #dbe7f3; }
-    .bar-track, .storage-track { height: 8px; background: #0d1324; border-radius: 999px; overflow: hidden; border: 1px solid #1f2a44; }
-    .bar-fill { height: 100%; width: 0%; background: linear-gradient(90deg, var(--teal), var(--gold)); }
-    .bar-count { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
-    .storage-track { margin-top: 8px; }
-    #storageBar { height: 100%; width: 0%; background: var(--teal); }
-    .empty { color: var(--muted); font-size: 13px; margin-top: 10px; }
-    @media (max-width: 820px) {
-      body { margin: 14px; }
-      .metrics, .dashboard-lower { grid-template-columns: 1fr; }
-      .bar-row { grid-template-columns: minmax(64px, 1fr) minmax(72px, 2fr) 38px; }
-    }
   </style>
 </head>
 <body>
   <h1>my--father-mother</h1>
   <div id="status" class="status"></div>
-  <section id="dashboard" class="dashboard" aria-label="Status and usage dashboard">
-    <div class="metrics">
-      <div class="metric">
-        <span class="metric-label">Clips</span>
-        <strong id="metricTotal">0</strong>
-        <small id="metricRecent">0 in 24h / 0 in 7d</small>
-      </div>
-      <div class="metric">
-        <span class="metric-label">Storage</span>
-        <strong id="metricStorage">0 MB</strong>
-        <div class="storage-track"><div id="storageBar"></div></div>
-        <small id="metricStorageCap">cap not set</small>
-      </div>
-      <div class="metric">
-        <span class="metric-label">Organization</span>
-        <strong id="metricOrg">0 pinned</strong>
-        <small id="metricTags">0 tagged / 0 notes</small>
-      </div>
-      <div class="metric">
-        <span class="metric-label">Index</span>
-        <strong id="metricVectors">0%</strong>
-        <small id="metricLatest">latest n/a</small>
-      </div>
-    </div>
-    <div class="dashboard-lower">
-      <div class="panel">
-        <div class="panel-title">Top apps</div>
-        <div id="topApps" class="bar-list"></div>
-      </div>
-      <div class="panel">
-        <div class="panel-title">Top tags</div>
-        <div id="topTags" class="bar-list"></div>
-      </div>
-      <div class="panel">
-        <div class="panel-title">Daily clips</div>
-        <div id="dailyClips" class="bar-list"></div>
-      </div>
-    </div>
-  </section>
   <div>
     <input id="q" placeholder="Search..." size="40"/>
     <label><input type="checkbox" id="semantic"/> semantic</label>
@@ -4349,74 +3779,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
   <script>
     let lastMode = 'recent';
     let autoTimer = null;
-    function formatNumber(value) {
-      return new Intl.NumberFormat().format(Number(value || 0));
-    }
-    function formatMb(value) {
-      const n = Number(value || 0);
-      const digits = n >= 10 ? 1 : 3;
-      return `${n.toFixed(digits).replace(/\\.0+$|0+$/,'').replace(/\\.$/,'')} MB`;
-    }
-    function setText(id, value) {
-      const el = document.getElementById(id);
-      if (el) el.textContent = value;
-    }
-    function renderBars(id, items) {
-      const el = document.getElementById(id);
-      if (!el) return;
-      el.innerHTML = '';
-      if (!items || !items.length) {
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'No data yet';
-        el.appendChild(empty);
-        return;
-      }
-      const max = Math.max(...items.map(it => Number(it.count || 0)), 1);
-      items.forEach(it => {
-        const row = document.createElement('div');
-        row.className = 'bar-row';
-        const name = document.createElement('span');
-        name.className = 'bar-name';
-        name.textContent = it.name || it.day || 'unknown';
-        name.title = name.textContent;
-        const track = document.createElement('div');
-        track.className = 'bar-track';
-        const fill = document.createElement('div');
-        fill.className = 'bar-fill';
-        fill.style.width = `${Math.max(4, (Number(it.count || 0) / max) * 100)}%`;
-        track.appendChild(fill);
-        const count = document.createElement('span');
-        count.className = 'bar-count';
-        count.textContent = formatNumber(it.count);
-        row.appendChild(name);
-        row.appendChild(track);
-        row.appendChild(count);
-        el.appendChild(row);
-      });
-    }
-    function renderDashboard(s) {
-      const u = s.usage || {};
-      const storage = u.storage || {};
-      const total = Number(u.total_clips || s.count || 0);
-      const storagePct = storage.used_pct == null ? null : Math.max(0, Math.min(100, Number(storage.used_pct)));
-      setText('metricTotal', formatNumber(total));
-      setText('metricRecent', `${formatNumber(u.clips_last_24h)} in 24h / ${formatNumber(u.clips_last_7d)} in 7d`);
-      setText('metricStorage', formatMb(storage.db_size_mb || s.db_size_mb || 0));
-      setText('metricStorageCap', storagePct == null ? 'cap not set' : `${storagePct.toFixed(1)}% of ${formatMb(storage.max_db_mb)}`);
-      setText('metricOrg', `${formatNumber(u.pinned_clips)} pinned`);
-      setText('metricTags', `${formatNumber(u.tagged_clips)} tagged / ${formatNumber(u.note_count)} notes`);
-      setText('metricVectors', `${Number(u.vector_coverage_pct || 0).toFixed(1)}%`);
-      setText('metricLatest', `latest ${u.latest_clip_at || s.latest || 'n/a'}`);
-      const storageBar = document.getElementById('storageBar');
-      if (storageBar) {
-        storageBar.style.width = storagePct == null ? '0%' : `${storagePct}%`;
-        storageBar.style.background = storagePct != null && storagePct >= 80 ? 'var(--warn)' : 'var(--teal)';
-      }
-      renderBars('topApps', u.top_apps || []);
-      renderBars('topTags', u.top_tags || []);
-      renderBars('dailyClips', (u.daily_counts || []).map(d => ({name: d.day, count: d.count})));
-    }
     async function loadTags() {
       const r = await fetch('/tags');
       const data = await r.json();
@@ -4434,7 +3796,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         const r = await fetch('/status');
         if (!r.ok) return;
         const s = await r.json();
-        renderDashboard(s);
         const paused = !!s.paused;
         const maxMb = s.max_db_mb || 0;
         const usedMb = s.db_size_mb || 0;
@@ -4512,7 +3873,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
       if (!enabled || !seconds || seconds <= 0) return;
       autoTimer = setInterval(() => {
         if (document.visibilityState === 'hidden') return;
-        loadStatus();
         if (lastMode === 'search') return;
         if (lastMode === 'topics') {
           loadTopics();
@@ -4691,9 +4051,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             s["db_size_mb"] = round(s["db_size_bytes"] / (1024 * 1024), 3)
             self._send(200, s)
             return
-        if path == "/usage":
-            self._send(200, usage_snapshot(conn))
-            return
         if path == "/recent":
             limit = int(qs.get("limit", [10])[0])
             app = qs.get("app", [None])[0]
@@ -4855,7 +4212,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/config":
             mb = get_max_bytes(conn, None)
-            license_info = license_snapshot(conn)
             self._send(
                 200,
                 {
@@ -4864,17 +4220,10 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     "allow_secrets": get_allow_secrets(conn, None),
                     "notify": get_notify(conn, None),
                     "max_db_mb": get_max_db_mb(conn, None),
-                    "pro_enabled": license_info["pro_enabled"],
-                    "license_type": license_info["license_type"],
-                    "license_status": license_info["license_status"],
-                    "has_license_key": license_info["has_license_key"],
-                    "upgrade_url": license_info["upgrade_url"],
                     "embedder": get_embedder(conn, None),
                     "cap_by_app": get_cap_map(conn, "cap_by_app"),
                     "cap_by_tag": get_cap_map(conn, "cap_by_tag"),
                     "evict_mode": get_evict_mode(conn),
-                    "gumroad_permalink": get_setting(conn, "gumroad_permalink", ""),
-                    "gumroad_webhook_secret": "***" if gumroad_webhook_secret(conn) else "",
                     "sync_target": get_setting(conn, "sync_target", ""),
                     "sync_interval": get_sync_interval(conn),
                     "ai_recall_cmd": get_setting(conn, "ai_recall_cmd", ""),
@@ -4888,26 +4237,10 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         if path == "/settings":
             self._send(200, settings_snapshot(conn))
             return
-        if path == "/license":
-            key = get_setting_typed(conn, "license_key")
-            tier = get_setting_typed(conn, "license_tier")
-            verified_at = get_setting_typed(conn, "license_verified_at")
-            self._send(200, {
-                "tier": tier,
-                "key_summary": _license_key_summary(key),
-                "verified_at": verified_at,
-                "checkout_url": LEMON_SQUEEZY_CHECKOUT_URL,
-                "has_premium": has_premium(conn),
-                "premium_features": PREMIUM_FEATURES,
-            })
-            return
         if path == "/status":
             self._send(200, status_snapshot(conn))
             return
         if path == "/federate_export":
-            if not has_premium(conn):
-                self._send(402, {"error": "premium feature — purchase at " + LEMON_SQUEEZY_CHECKOUT_URL})
-                return
             limit = int(qs.get("limit", [200])[0])
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
@@ -4985,26 +4318,12 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/semantic_search":
-            if not has_premium(conn):
-                self._send(402, {"error": "premium feature — purchase at " + LEMON_SQUEEZY_CHECKOUT_URL})
-                return
             q = qs.get("q", [""])[0]
             limit = int(qs.get("limit", [10])[0])
             app = qs.get("app", [None])[0]
             tag = qs.get("tag", [None])[0]
             pool = int(qs.get("pool", [2000])[0])
-            requested_embedder = get_embedder(conn, qs.get("embedder", [None])[0])
-            if requested_embedder == "e5-small" and not is_pro_enabled(conn):
-                self._send(
-                    402,
-                    {
-                        "error": "e5-small semantic search requires Pro",
-                        "pro_enabled": False,
-                        "upgrade_url": get_upgrade_url(conn),
-                    },
-                )
-                return
-            embedder_kind, _embedder_warning = resolve_embedder_for_use(conn, qs.get("embedder", [None])[0])
+            embedder_kind = get_embedder(conn, qs.get("embedder", [None])[0])
             qvec, model_used = embed_from_kind(embedder_kind, q)
             pins_only = qs.get("pins_only", ["false"])[0].lower() in ("1", "true", "yes", "on")
             since_param = qs.get("since", [None])[0]
@@ -5051,32 +4370,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         path = self.path
         conn = self.conn
         init_db(conn)
-        if path == "/webhooks/gumroad":
-            body = self._read_body()
-            secret = gumroad_webhook_secret(conn)
-            if not secret:
-                self._send(503, {"error": "gumroad webhook secret is not configured"})
-                return
-            signature = self.headers.get("X-Gumroad-Signature", "")
-            if not verify_gumroad_signature(body, signature, secret):
-                self._send(401, {"error": "invalid signature"})
-                return
-            payload = parse_gumroad_payload(body, self.headers.get("Content-Type", ""))
-            ok, msg, valid = apply_gumroad_license_event(conn, payload)
-            if not ok:
-                status = 400 if msg == "missing license_key" else 401
-                self._send(status, {"error": msg, "license_valid": valid})
-                return
-            self._send(
-                200,
-                {
-                    "ok": True,
-                    "stored": True,
-                    "pro_enabled": is_pro_enabled(conn),
-                    "license_valid": True if valid is None else valid,
-                },
-            )
-            return
         if path == "/pin":
             data = self._parse_json()
             try:
@@ -5141,45 +4434,7 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                     return
                 set_setting(conn, "max_db_mb", str(intval))
                 updated["max_db_mb"] = intval
-            if "pro_enabled" in data:
-                parsed = data["pro_enabled"] if isinstance(data["pro_enabled"], bool) else parse_bool_value(str(data["pro_enabled"]))
-                if parsed is None:
-                    self._send(400, {"error": "invalid pro_enabled"})
-                    return
-                set_pro_enabled(conn, bool(parsed))
-                updated["pro_enabled"] = is_pro_enabled(conn)
-                updated["license_type"] = license_snapshot(conn)["license_type"]
-            if "license_key" in data:
-                set_license_key(conn, str(data["license_key"]))
-                updated["license_key"] = mask_secret(get_license_key(conn))
-                updated["pro_enabled"] = is_pro_enabled(conn)
-                updated["license_type"] = license_snapshot(conn)["license_type"]
-            if "gumroad_license_key" in data:
-                set_license_key(conn, str(data["gumroad_license_key"]))
-                updated["gumroad_license_key"] = mask_secret(get_license_key(conn))
-                updated["pro_enabled"] = is_pro_enabled(conn)
-                updated["license_type"] = license_snapshot(conn)["license_type"]
-            if "gumroad_webhook_secret" in data:
-                set_setting(conn, "gumroad_webhook_secret", str(data["gumroad_webhook_secret"]))
-                updated["gumroad_webhook_secret"] = "***" if gumroad_webhook_secret(conn) else ""
-            if "gumroad_permalink" in data:
-                set_setting(conn, "gumroad_permalink", str(data["gumroad_permalink"]))
-                updated["gumroad_permalink"] = get_setting(conn, "gumroad_permalink", "")
-            if "upgrade_url" in data:
-                set_setting(conn, "upgrade_url", str(data["upgrade_url"]))
-                updated["upgrade_url"] = get_upgrade_url(conn)
             if "embedder" in data:
-                requested_embedder = get_embedder(conn, str(data["embedder"]))
-                if requested_embedder == "e5-small" and not is_pro_enabled(conn):
-                    self._send(
-                        402,
-                        {
-                            "error": "e5-small embeddings require Pro",
-                            "pro_enabled": False,
-                            "upgrade_url": get_upgrade_url(conn),
-                        },
-                    )
-                    return
                 set_embedder(conn, str(data["embedder"]))
                 updated["embedder"] = get_embedder(conn, None)
             if "cap_by_app" in data:
@@ -5325,9 +4580,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(500, {"error": "failed to insert"})
             return
         if path == "/federate_import":
-            if not has_premium(conn):
-                self._send(402, {"error": "premium feature — purchase at " + LEMON_SQUEEZY_CHECKOUT_URL})
-                return
             data = self._parse_json()
             items = data.get("items")
             if not isinstance(items, list):
@@ -5385,9 +4637,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(400, {"error": msg})
             return
         if path == "/ai":
-            if not has_premium(conn):
-                self._send(402, {"error": "premium feature — purchase at " + LEMON_SQUEEZY_CHECKOUT_URL})
-                return
             data = self._parse_json()
             kind = str(data.get("kind", "")).lower()
             if kind not in ("recall", "fill"):
@@ -5414,30 +4663,6 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "id": new_id, "message": msg, "output": out})
             else:
                 self._send(400, {"error": msg})
-            return
-        if path == "/license":
-            data = self._parse_json()
-            action = data.get("action", "")
-            if action == "activate":
-                key = str(data.get("key", "")).strip()
-                if not key:
-                    self._send(400, {"error": "missing license key"})
-                    return
-                ok, msg = verify_license_online(key)
-                if ok:
-                    set_setting_typed(conn, "license_key", key)
-                    set_setting_typed(conn, "license_tier", "premium")
-                    set_setting_typed(conn, "license_verified_at", datetime.now(timezone.utc).isoformat())
-                    self._send(200, {"ok": True, "tier": "premium", "message": msg})
-                else:
-                    self._send(400, {"error": msg})
-            elif action == "deactivate":
-                set_setting_typed(conn, "license_key", "")
-                set_setting_typed(conn, "license_tier", "free")
-                set_setting_typed(conn, "license_verified_at", "")
-                self._send(200, {"ok": True, "tier": "free"})
-            else:
-                self._send(400, {"error": "action must be activate or deactivate"})
             return
         if path == "/purge":
             data = self._parse_json()
@@ -5662,12 +4887,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_ml.add_argument("--status", action="store_true", help="show ML/LTM status")
     p_ml.set_defaults(func=cmd_ml)
 
-    p_license = sub.add_parser("license", help="manage premium license activation")
-    p_license.add_argument("--activate", help="activate a license key (verifies online)")
-    p_license.add_argument("--deactivate", action="store_true", help="deactivate license")
-    p_license.add_argument("--checkout-url", action="store_true", help="print the purchase URL")
-    p_license.set_defaults(func=cmd_license)
-
     p_about = sub.add_parser("about", help="show app/about info")
     p_about.add_argument("--json", action="store_true", help="print JSON output")
     p_about.set_defaults(func=cmd_about)
@@ -5704,8 +4923,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_config = sub.add_parser("config", help="get/set config (max_bytes)")
     group_cfg = p_config.add_mutually_exclusive_group(required=True)
-    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, pro_enabled, license_key, gumroad_* settings, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_* settings, ai_recall_cmd, ai_fill_cmd)")
-    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, pro_enabled, license_key, gumroad_* settings, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_* settings, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--get", help="get a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_*_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
+    group_cfg.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"), help="set a key (max_bytes, allow_secrets, max_db_mb, notify, embedder, cap_by_app, cap_by_tag, evict_mode, allow_pdf, allow_images, auto_summary_cmd, auto_tag_cmd, helper_rewrite_cmd, helper_shorten_cmd, helper_extract_cmd, sync_target, sync_interval, backup_bucket, backup_endpoint, backup_region, backup_prefix, backup_access_key, backup_secret_key, backup_passphrase, ai_recall_cmd, ai_fill_cmd)")
     p_config.set_defaults(func=cmd_config)
 
     p_purge = sub.add_parser("purge", help="purge clips by age/app/keep-last/all")
