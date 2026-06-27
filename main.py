@@ -49,6 +49,11 @@ DEFAULT_UI_METRICS = "default"
 DEFAULT_UI_TOOLBAR = "suggested"
 DEFAULT_PERSONAL_CLOUD_STATUS = "disconnected"
 
+LEMON_SQUEEZY_CHECKOUT_URL = (
+    "https://my-father-mother.lemonsqueezy.com/checkout/buy/"
+)
+DEFAULT_UPGRADE_URL = "https://gumroad.com/l/my-father-mother-pro"
+
 DEFAULT_MAX_BYTES = 16_384  # ~16 KB
 DEFAULT_NOTIFY = False
 DEFAULT_WATCH_SYNC_INTERVAL = 60.0
@@ -620,12 +625,136 @@ def stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+def usage_snapshot(conn: sqlite3.Connection, top_limit: int = 5, days: int = 7) -> dict:
+    top_limit = max(1, min(int(top_limit), 20))
+    days = max(1, min(int(days), 31))
+    base = stats(conn)
+
+    def count_value(sql: str, params: tuple = ()) -> int:
+        row = conn.execute(sql, params).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    total_clips = int(base.get("count") or 0)
+    first_row = conn.execute("SELECT MIN(created_at) AS first FROM clips").fetchone()
+    size_row = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(LENGTH(content)), 0) AS content_chars,
+            COALESCE(AVG(LENGTH(content)), 0) AS avg_clip_chars
+        FROM clips
+        """
+    ).fetchone()
+    db_size_bytes = int(base.get("db_size_bytes") or 0)
+    db_size_mb = round(db_size_bytes / (1024 * 1024), 3)
+    max_db_mb = get_max_db_mb(conn, None)
+    storage_pct = round((db_size_mb / max_db_mb) * 100, 1) if max_db_mb else None
+
+    top_apps = [
+        {"name": row["name"], "count": row["clip_count"], "latest": row["latest"]}
+        for row in conn.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(source_app, ''), 'unknown') AS name,
+                COUNT(*) AS clip_count,
+                MAX(created_at) AS latest
+            FROM clips
+            GROUP BY COALESCE(NULLIF(source_app, ''), 'unknown')
+            ORDER BY clip_count DESC, latest DESC
+            LIMIT ?
+            """,
+            (top_limit,),
+        ).fetchall()
+    ]
+    top_tags = [
+        {"name": row["name"], "count": row["clip_count"], "latest": row["latest"]}
+        for row in conn.execute(
+            """
+            SELECT t.name, COUNT(ct.clip_id) AS clip_count, MAX(c.created_at) AS latest
+            FROM tags t
+            JOIN clip_tags ct ON ct.tag_id = t.id
+            JOIN clips c ON c.id = ct.clip_id
+            GROUP BY t.id, t.name
+            ORDER BY clip_count DESC, latest DESC
+            LIMIT ?
+            """,
+            (top_limit,),
+        ).fetchall()
+    ]
+    daily_counts = [
+        {"day": row["day"], "count": row["clip_count"]}
+        for row in conn.execute(
+            """
+            SELECT date(created_at) AS day, COUNT(*) AS clip_count
+            FROM clips
+            WHERE datetime(created_at) >= datetime('now', ?)
+            GROUP BY date(created_at)
+            ORDER BY day ASC
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+    ]
+    embedding_models = [
+        {"model": row["model"], "count": row["clip_count"]}
+        for row in conn.execute(
+            """
+            SELECT model, COUNT(*) AS clip_count
+            FROM clip_vectors
+            GROUP BY model
+            ORDER BY clip_count DESC, model ASC
+            """
+        ).fetchall()
+    ]
+    vector_count = sum(item["count"] for item in embedding_models)
+    vector_coverage = round((vector_count / total_clips) * 100, 1) if total_clips else 0.0
+
+    return {
+        "total_clips": total_clips,
+        "pinned_clips": count_value("SELECT COUNT(*) FROM clips WHERE pinned = 1"),
+        "tagged_clips": count_value("SELECT COUNT(DISTINCT clip_id) FROM clip_tags"),
+        "tag_count": count_value("SELECT COUNT(*) FROM tags"),
+        "note_count": count_value("SELECT COUNT(*) FROM clip_notes"),
+        "repeat_events": count_value("SELECT COUNT(*) FROM clip_events"),
+        "clips_last_24h": count_value(
+            "SELECT COUNT(*) FROM clips WHERE datetime(created_at) >= datetime('now', '-1 day')"
+        ),
+        "clips_last_7d": count_value(
+            "SELECT COUNT(*) FROM clips WHERE datetime(created_at) >= datetime('now', '-7 days')"
+        ),
+        "events_last_24h": count_value(
+            "SELECT COUNT(*) FROM clip_events WHERE datetime(seen_at) >= datetime('now', '-1 day')"
+        ),
+        "first_clip_at": first_row["first"] if first_row else None,
+        "latest_clip_at": base.get("latest"),
+        "content_chars": int(size_row["content_chars"] or 0) if size_row else 0,
+        "average_clip_chars": round(float(size_row["avg_clip_chars"] or 0), 1) if size_row else 0.0,
+        "storage": {
+            "db_size_bytes": db_size_bytes,
+            "db_size_mb": db_size_mb,
+            "max_db_mb": max_db_mb,
+            "used_pct": storage_pct,
+        },
+        "vector_count": vector_count,
+        "vector_coverage_pct": vector_coverage,
+        "embedding_models": embedding_models,
+        "top_apps": top_apps,
+        "top_tags": top_tags,
+        "daily_counts": daily_counts,
+    }
+
+
 def status_snapshot(conn: sqlite3.Connection) -> dict:
-    s = stats(conn)
+    usage = usage_snapshot(conn)
+    license_info = license_snapshot(conn)
     return {
         "paused": is_paused(conn),
         "allow_secrets": get_allow_secrets(conn, None),
         "notify": get_notify(conn, None),
+        "pro_enabled": license_info["pro_enabled"],
+        "license_type": license_info["license_type"],
+        "license_status": license_info["license_status"],
+        "has_license_key": license_info["has_license_key"],
+        "device_count": license_info["device_count"],
+        "upgrade_url": license_info["upgrade_url"],
         "embedder": get_embedder(conn, None),
         "max_bytes": get_max_bytes(conn, None),
         "max_db_mb": get_max_db_mb(conn, None),
@@ -639,12 +768,13 @@ def status_snapshot(conn: sqlite3.Connection) -> dict:
         "ml_processing_mode": get_setting(
             conn, "ml_processing_mode", DEFAULT_ML_PROCESSING_MODE
         ),
-        "count": s.get("count", 0),
-        "latest": s.get("latest"),
-        "db_size_mb": round((s.get("db_size_bytes", 0) or 0) / (1024 * 1024), 3),
+        "count": usage["total_clips"],
+        "latest": usage["latest_clip_at"],
+        "db_size_mb": usage["storage"]["db_size_mb"],
         "blocklist_size": len(get_blocklist(conn)),
         "sync_target": get_setting(conn, "sync_target", ""),
         "sync_interval": get_sync_interval(conn),
+        "usage": usage,
     }
 
 
@@ -762,6 +892,85 @@ def set_bool_setting(conn: sqlite3.Connection, key: str, value: bool) -> None:
     set_setting(conn, key, "1" if value else "0")
 
 
+def get_license_key(conn: sqlite3.Connection) -> str:
+    return (
+        get_setting(conn, "gumroad_license_key", "").strip()
+        or get_setting(conn, "license_key", "").strip()
+    )
+
+
+def mask_secret(value: str) -> str:
+    clean = (value or "").strip()
+    if not clean:
+        return ""
+    if len(clean) <= 8:
+        return "***"
+    return f"{clean[:4]}...{clean[-4:]}"
+
+
+def set_license_key(conn: sqlite3.Connection, value: str) -> None:
+    clean = (value or "").strip()
+    set_setting(conn, "gumroad_license_key", clean)
+    set_setting(conn, "license_key", clean)
+    if clean:
+        set_bool_setting(conn, "pro_enabled", True)
+        set_setting(conn, "license_type", "pro")
+        set_setting(conn, "license_status", "active")
+        set_setting(conn, "license_updated_at", datetime.now(timezone.utc).isoformat())
+    else:
+        set_bool_setting(conn, "pro_enabled", False)
+        set_setting(conn, "license_type", "free")
+        set_setting(conn, "license_status", "inactive")
+        set_setting(conn, "license_updated_at", datetime.now(timezone.utc).isoformat())
+
+
+def is_pro_enabled(conn: sqlite3.Connection) -> bool:
+    raw = get_setting(conn, "pro_enabled", "").strip()
+    if raw:
+        parsed = parse_bool_value(raw)
+        if parsed is not None:
+            return parsed
+    return bool(get_license_key(conn))
+
+
+def set_pro_enabled(conn: sqlite3.Connection, enabled: bool) -> None:
+    set_bool_setting(conn, "pro_enabled", enabled)
+    set_setting(conn, "license_type", "pro" if enabled else "free")
+    if not enabled:
+        set_setting(conn, "license_status", "inactive")
+
+
+def get_upgrade_url(conn: sqlite3.Connection) -> str:
+    return get_setting(conn, "upgrade_url", DEFAULT_UPGRADE_URL).strip() or DEFAULT_UPGRADE_URL
+
+
+def license_snapshot(conn: sqlite3.Connection) -> dict:
+    enabled = is_pro_enabled(conn)
+    key = get_license_key(conn)
+    return {
+        "pro_enabled": enabled,
+        "license_type": "pro" if enabled else "free",
+        "license_status": get_setting(conn, "license_status", "active" if enabled else "inactive"),
+        "license_key": mask_secret(key),
+        "has_license_key": bool(key),
+        "email": get_setting(conn, "gumroad_email", ""),
+        "device_count": 1 if enabled else 0,
+        "upgrade_url": get_upgrade_url(conn),
+    }
+
+
+def pro_required(feature: str, conn: sqlite3.Connection) -> tuple[bool, str]:
+    if is_pro_enabled(conn):
+        return True, ""
+    return False, f"{feature} requires Pro. Activate with `config --set license_key YOUR_KEY`."
+
+
+def gumroad_webhook_secret(conn: sqlite3.Connection) -> str:
+    return os.environ.get("GUMROAD_WEBHOOK_SECRET", "").strip() or get_setting(
+        conn, "gumroad_webhook_secret", ""
+    ).strip()
+
+
 SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "account_email": ("str", ""),
     "account_avatar": ("str", ""),
@@ -788,6 +997,9 @@ SETTINGS_SPEC: dict[str, tuple[str, object]] = {
     "ui_font_weight": ("str", DEFAULT_UI_FONT_WEIGHT),
     "ui_density": ("str", DEFAULT_UI_DENSITY),
     "telemetry_enabled": ("bool", False),
+    "license_key": ("str", ""),
+    "license_verified_at": ("str", ""),
+    "license_tier": ("str", "free"),
 }
 
 CONNECTED_APPS = [
@@ -858,13 +1070,18 @@ def mcp_base_url() -> str:
 
 def settings_snapshot(conn: sqlite3.Connection) -> dict:
     base = mcp_base_url()
+    license_info = license_snapshot(conn)
     return {
         "account": {
             "email": get_setting_typed(conn, "account_email"),
             "avatar": get_setting_typed(conn, "account_avatar"),
             "linked_accounts": get_setting_typed(conn, "account_linked"),
             "organizations": get_setting_typed(conn, "account_orgs"),
-            "upgrade_url": get_setting_typed(conn, "account_upgrade_url"),
+            "upgrade_url": license_info["upgrade_url"],
+            "pro_enabled": license_info["pro_enabled"],
+            "license_type": license_info["license_type"],
+            "license_status": license_info["license_status"],
+            "has_license_key": license_info["has_license_key"],
         },
         "personal_cloud": {
             "status": get_setting_typed(conn, "personal_cloud_status"),
@@ -922,7 +1139,33 @@ def settings_snapshot(conn: sqlite3.Connection) -> dict:
             "mcp_host": os.environ.get("MFM_MCP_HOST", "127.0.0.1"),
             "mcp_port": os.environ.get("MFM_MCP_PORT", "39300"),
         },
+        "license": {
+            "tier": get_setting_typed(conn, "license_tier"),
+            "key_summary": _license_key_summary(get_setting_typed(conn, "license_key")),
+            "verified_at": get_setting_typed(conn, "license_verified_at"),
+            "checkout_url": LEMON_SQUEEZY_CHECKOUT_URL,
+        },
     }
+
+
+def _license_key_summary(key: str) -> str:
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return key
+    return key[:4] + "..." + key[-4:]
+
+
+def has_premium(conn: sqlite3.Connection) -> bool:
+    return get_setting_typed(conn, "license_tier") == "premium"
+
+
+def require_premium(conn: sqlite3.Connection, feature: str = "") -> bool:
+    if has_premium(conn):
+        return True
+    feature_note = f" ({feature})" if feature else ""
+    say(MOTHER, f"premium feature required{feature_note}. Use `license --activate KEY` or buy at {LEMON_SQUEEZY_CHECKOUT_URL}")
+    return False
 
 
 def format_setting_value(value) -> str:
