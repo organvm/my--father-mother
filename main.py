@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
+import math
 import os
 import re
 import platform
@@ -20,6 +22,7 @@ import subprocess
 import sys
 import time
 import shutil
+import traceback
 from collections import Counter
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -99,6 +102,11 @@ ALLOWED_EXTS = {
     ".cfg",
 }
 DEFAULT_MAX_DB_MB = 512  # cap database size in MB by default
+MAX_HTTP_BODY_BYTES = 1_048_576
+MAX_HTTP_QUERY_FIELDS = 100
+MAX_HTTP_LIMIT = 5_000
+MAX_HTTP_TEXT_CHARS = 4_096
+MAX_HELPER_TIMEOUT = 120.0
 
 SECRET_PATTERNS = [
     re.compile(r"AKIA[0-9A-Z]{16}"),  # AWS access key
@@ -111,6 +119,212 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)apikey[^a-z0-9]?[:=][^\\s]{8,}"),
     re.compile(r"(?i)password[^a-z0-9]?[:=][^\\s]{6,}"),
 ]
+
+
+class InputValidationError(ValueError):
+    """Raised when a request or CLI argument fails validation."""
+
+
+def configure_logging(level: Optional[str] = None) -> None:
+    level_name = (level or os.environ.get("MFM_LOG_LEVEL") or "WARNING").upper()
+    numeric_level = getattr(logging, level_name, logging.WARNING)
+    logger = logging.getLogger("mfm")
+    logger.setLevel(numeric_level)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
+
+
+def _safe_log_value(key: str, value):
+    key_norm = key.lower()
+    sensitive = ("content", "selection", "html", "body", "payload", "secret", "password", "token", "api_key")
+    if any(part in key_norm for part in sensitive):
+        return "[REDACTED]"
+    if isinstance(value, str):
+        redacted = redact_secrets(value)
+        return redacted if len(redacted) <= 512 else redacted[:509] + "..."
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _safe_log_value(str(k), v) for k, v in list(value.items())[:50]}
+    if isinstance(value, (list, tuple, set)):
+        return [_safe_log_value(key, v) for v in list(value)[:50]]
+    return str(value)
+
+
+def structured_log(level: int, event: str, **fields) -> None:
+    configure_logging()
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "level": logging.getLevelName(level).lower(),
+        "event": event,
+    }
+    payload.update({key: _safe_log_value(key, value) for key, value in fields.items()})
+    logging.getLogger("mfm").log(level, json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def structured_exception(level: int, event: str, exc: BaseException, **fields) -> None:
+    fields["error_type"] = type(exc).__name__
+    fields["error"] = str(exc)
+    if os.environ.get("MFM_LOG_TRACE") == "1":
+        fields["traceback"] = traceback.format_exc(limit=20)
+    structured_log(level, event, **fields)
+
+
+def bounded_int(
+    value,
+    name: str,
+    default: Optional[int] = None,
+    minimum: Optional[int] = None,
+    maximum: Optional[int] = None,
+) -> int:
+    if value is None or value == "":
+        if default is not None:
+            return default
+        raise InputValidationError(f"{name} is required")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise InputValidationError(f"{name} must be an integer") from None
+    if minimum is not None and parsed < minimum:
+        raise InputValidationError(f"{name} must be >= {minimum}")
+    if maximum is not None and parsed > maximum:
+        raise InputValidationError(f"{name} must be <= {maximum}")
+    return parsed
+
+
+def bounded_float(
+    value,
+    name: str,
+    default: Optional[float] = None,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> float:
+    if value is None or value == "":
+        if default is not None:
+            return default
+        raise InputValidationError(f"{name} is required")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise InputValidationError(f"{name} must be a number") from None
+    if not math.isfinite(parsed):
+        raise InputValidationError(f"{name} must be finite")
+    if minimum is not None and parsed < minimum:
+        raise InputValidationError(f"{name} must be >= {minimum}")
+    if maximum is not None and parsed > maximum:
+        raise InputValidationError(f"{name} must be <= {maximum}")
+    return parsed
+
+
+def validate_port(value, name: str = "port") -> int:
+    return bounded_int(value, name, minimum=1, maximum=65535)
+
+
+def parse_request_target(target: str) -> tuple[str, dict[str, list[str]]]:
+    try:
+        parsed = urllib.parse.urlsplit(target)
+        qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True, max_num_fields=MAX_HTTP_QUERY_FIELDS)
+    except ValueError as exc:
+        raise InputValidationError(f"invalid request target: {exc}") from None
+    return parsed.path or "/", qs
+
+
+def query_first(qs: dict[str, list[str]], name: str, default=None):
+    values = qs.get(name)
+    if not values:
+        return default
+    return values[0]
+
+
+def query_text(
+    qs: dict[str, list[str]],
+    name: str,
+    default: Optional[str] = None,
+    max_chars: int = MAX_HTTP_TEXT_CHARS,
+    required: bool = False,
+) -> Optional[str]:
+    value = query_first(qs, name, default)
+    if value is None:
+        if required:
+            raise InputValidationError(f"{name} is required")
+        return default
+    text = str(value)
+    if required and not text.strip():
+        raise InputValidationError(f"{name} is required")
+    if len(text) > max_chars:
+        raise InputValidationError(f"{name} must be <= {max_chars} characters")
+    return text
+
+
+def query_int(
+    qs: dict[str, list[str]],
+    name: str,
+    default: int,
+    minimum: int = 0,
+    maximum: int = MAX_HTTP_LIMIT,
+) -> int:
+    return bounded_int(query_first(qs, name, default), name, default=default, minimum=minimum, maximum=maximum)
+
+
+def query_float(
+    qs: dict[str, list[str]],
+    name: str,
+    default: Optional[float] = None,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> Optional[float]:
+    value = query_first(qs, name, None)
+    if value is None:
+        return default
+    return bounded_float(value, name, minimum=minimum, maximum=maximum)
+
+
+def query_bool(qs: dict[str, list[str]], name: str, default: bool = False) -> bool:
+    value = query_first(qs, name, None)
+    if value is None:
+        return default
+    parsed = parse_bool_value(str(value))
+    if parsed is None:
+        raise InputValidationError(f"{name} must be true/false")
+    return parsed
+
+
+def query_time_window(qs: dict[str, list[str]]) -> tuple[Optional[str], Optional[str]]:
+    since_param = query_text(qs, "since", None, max_chars=128)
+    until_param = query_text(qs, "until", None, max_chars=128)
+    hours = query_float(qs, "hours", None, minimum=0.0, maximum=24.0 * 3650)
+    since_iso = parse_iso_dt(since_param) if since_param else None
+    if since_param and not since_iso:
+        raise InputValidationError("since must be an ISO timestamp")
+    if hours is not None:
+        since_iso = iso_hours_ago(hours)
+    until_iso = parse_iso_dt(until_param) if until_param else None
+    if until_param and not until_iso:
+        raise InputValidationError("until must be an ISO timestamp")
+    return since_iso, until_iso
+
+
+def positive_json_int(data: dict, key: str, default: Optional[int] = None, minimum: int = 0, maximum: int = MAX_HTTP_LIMIT) -> Optional[int]:
+    if key not in data or data.get(key) is None:
+        return default
+    return bounded_int(data.get(key), key, minimum=minimum, maximum=maximum)
+
+
+def finite_json_float(
+    data: dict,
+    key: str,
+    default: Optional[float] = None,
+    minimum: Optional[float] = None,
+    maximum: Optional[float] = None,
+) -> Optional[float]:
+    if key not in data or data.get(key) is None:
+        return default
+    return bounded_float(data.get(key), key, minimum=minimum, maximum=maximum)
 
 
 def say(persona: str, message: str) -> None:
@@ -3512,9 +3726,14 @@ def cmd_palette(args: argparse.Namespace) -> None:
 class ApiHandler(http.server.BaseHTTPRequestHandler):
     def __init__(self, *inner_args, conn: sqlite3.Connection, **kwargs):
         self.conn = conn
+        self.request_id = ""
+        self._status = 0
         super().__init__(*inner_args, **kwargs)
 
     def _send(self, status: int, data: dict) -> None:
+        self._status = status
+        if status >= 400 and self.request_id and "request_id" not in data:
+            data = {**data, "request_id": self.request_id}
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -3523,21 +3742,64 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_error(self, status: int, message: str, code: str = "error") -> None:
+        self._send(status, {"error": message, "code": code})
+
     def _parse_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except ValueError:
+            raise InputValidationError("Content-Length must be an integer") from None
+        if length < 0:
+            raise InputValidationError("Content-Length must be >= 0")
+        if length > MAX_HTTP_BODY_BYTES:
+            raise InputValidationError(f"request body must be <= {MAX_HTTP_BODY_BYTES} bytes")
         if length == 0:
             return {}
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw)
+            data = json.loads(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise InputValidationError("request body must be UTF-8 JSON") from None
         except json.JSONDecodeError:
-            return {}
+            raise InputValidationError("request body must be valid JSON") from None
+        if not isinstance(data, dict):
+            raise InputValidationError("request body must be a JSON object")
+        return data
 
     def log_message(self, format: str, *args) -> None:
         # Quiet by default
         return
 
+    def _handle_request(self, method: str, handler) -> None:
+        self.request_id = hashlib.sha256(f"{time.time_ns()}:{id(self)}".encode("utf-8")).hexdigest()[:12]
+        self._status = 0
+        path = "/"
+        started = time.monotonic()
+        try:
+            path, _ = parse_request_target(self.path)
+            handler()
+        except InputValidationError as exc:
+            structured_log(logging.WARNING, "http_bad_request", request_id=self.request_id, method=method, path=path, error=str(exc))
+            self._send_error(400, str(exc), code="bad_request")
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            status = 400 if "fts" in message or "syntax" in message or "malformed" in message else 500
+            event = "http_bad_request" if status == 400 else "http_error"
+            structured_exception(logging.WARNING if status == 400 else logging.ERROR, event, exc, request_id=self.request_id, method=method, path=path)
+            self._send_error(status, "invalid query" if status == 400 else "internal server error", code="bad_request" if status == 400 else "internal_error")
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            structured_exception(logging.WARNING, "http_client_disconnected", exc, request_id=self.request_id, method=method, path=path)
+        except Exception as exc:
+            structured_exception(logging.ERROR, "http_error", exc, request_id=self.request_id, method=method, path=path)
+            self._send_error(500, "internal server error", code="internal_error")
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+            structured_log(logging.INFO, "http_request", request_id=self.request_id, method=method, path=path, status=self._status or None, elapsed_ms=elapsed_ms)
+
     def do_OPTIONS(self) -> None:
+        self._status = 204
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
@@ -3545,8 +3807,10 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
-        path, _, query = self.path.partition("?")
-        qs = urllib.parse.parse_qs(query)
+        self._handle_request("GET", self._do_GET)
+
+    def _do_GET(self) -> None:
+        path, qs = parse_request_target(self.path)
         conn = self.conn
         init_db(conn)
         if path in ("/", "/ui"):
