@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import re
 import platform
@@ -27,6 +28,7 @@ from typing import Optional, Tuple, Iterable, Dict
 
 DB_DIR = Path.home() / ".my-father-mother"
 DB_PATH = DB_DIR / "mfm.db"
+SECRET_PATH = DB_DIR / "api_key"
 
 MOTHER = "mother"  # capture persona (moon domain)
 FATHER = "father"  # retrieval persona (sun domain)
@@ -1544,105 +1546,108 @@ def cmd_watch(args: argparse.Namespace) -> None:
     say(MOTHER, "watching clipboard... Ctrl+C to stop.")
     try:
         while True:
-            paused = is_paused(conn)
-            if paused:
-                if last_paused is not True:
-                    say(MOTHER, "paused; not capturing.")
-                last_paused = True
-                time.sleep(interval)
-                continue
-            if last_paused is True:
-                say(MOTHER, "resumed capture.")
-            last_paused = False
+            try:
+                paused = is_paused(conn)
+                if paused:
+                    if last_paused is not True:
+                        say(MOTHER, "paused; not capturing.")
+                    last_paused = True
+                    time.sleep(interval)
+                    continue
+                if last_paused is True:
+                    say(MOTHER, "resumed capture.")
+                last_paused = False
 
-            clip = read_clipboard()
-            if clip:
-                context_level = get_setting(conn, "ml_context_level", DEFAULT_ML_CONTEXT_LEVEL)
-                ltm_enabled = get_bool_setting(conn, "ltm_enabled", DEFAULT_LTM_ENABLED)
-                allow_summary, allow_tags = auto_context_flags(context_level)
-                if not ltm_enabled:
-                    allow_summary = False
-                    allow_tags = False
-                digest = hashlib.sha256(clip.encode("utf-8")).hexdigest()
-                if digest != last_digest:
-                    app, window = frontmost_app_and_window()
-                    cap_by_app = get_cap_map(conn, "cap_by_app")
-                    blockset = get_blocklist(conn)
-                    if app.strip().lower() in blockset:
-                        last_digest = digest
-                        time.sleep(interval)
-                        continue
-                    clip_bytes = clip.encode("utf-8", errors="ignore")
-                    if len(clip_bytes) > max_bytes:
-                        say(MOTHER, f"skipped large clip ({len(clip_bytes)} bytes > max {max_bytes})")
-                        if notify_enabled:
-                            toast("Mother skipped large clip", f"{app} ({len(clip_bytes)} bytes)")
-                        last_digest = digest
-                        time.sleep(interval)
-                        continue
-                    if not allow_secrets and looks_like_secret(clip):
-                        if args.redact:
-                            clip = redact_secrets(clip)
-                        else:
-                            say(MOTHER, "skipped clip that looks like a secret (pattern match). Enable allow_secrets or use --redact.")
-                            if notify_enabled:
-                                toast("Mother skipped secret-looking clip", app or "unknown")
+                clip = read_clipboard()
+                if clip:
+                    context_level = get_setting(conn, "ml_context_level", DEFAULT_ML_CONTEXT_LEVEL)
+                    ltm_enabled = get_bool_setting(conn, "ltm_enabled", DEFAULT_LTM_ENABLED)
+                    allow_summary, allow_tags = auto_context_flags(context_level)
+                    if not ltm_enabled:
+                        allow_summary = False
+                        allow_tags = False
+                    digest = hashlib.sha256(clip.encode("utf-8")).hexdigest()
+                    if digest != last_digest:
+                        app, window = frontmost_app_and_window()
+                        cap_by_app = get_cap_map(conn, "cap_by_app")
+                        blockset = get_blocklist(conn)
+                        if app.strip().lower() in blockset:
                             last_digest = digest
                             time.sleep(interval)
                             continue
-
-                    existing_id = get_clip_id_by_hash(conn, digest)
-                    if existing_id:
-                        insert_event(conn, existing_id)
-                        say(MOTHER, f"noted repeat clip #{existing_id}")
-                    else:
-                        # derive a simple title (first line trimmed), optionally summarize
-                        first_line = clip.strip().splitlines()[0] if clip.strip() else ""
-                        if auto_summary_cmd and allow_summary:
-                            maybe = run_helper(auto_summary_cmd, clip, timeout=6.0)
-                            if maybe:
-                                first_line = maybe
-                        if len(first_line) > 120:
-                            first_line = first_line[:117] + "..."
-                        inserted_id = insert_clip(conn, clip, app=app, window=window, digest=digest, title=first_line, embedder_override=embedder_choice)
-                        if inserted_id:
-                            insert_event(conn, inserted_id)
-                            say(MOTHER, f"saved clip #{inserted_id}")
+                        clip_bytes = clip.encode("utf-8", errors="ignore")
+                        if len(clip_bytes) > max_bytes:
+                            say(MOTHER, f"skipped large clip ({len(clip_bytes)} bytes > max {max_bytes})")
                             if notify_enabled:
-                                toast("Mother saved clip", f"#{inserted_id} from {app}")
-                            if auto_tag_cmd and allow_tags:
-                                tags_out = run_helper(auto_tag_cmd, clip, timeout=6.0)
-                                if tags_out:
-                                    # split on comma or whitespace
-                                    parts = [t.strip().lower() for t in re.split(r"[,\s]+", tags_out) if t.strip()]
-                                    for t in parts:
-                                        assign_tag(conn, inserted_id, t)
-                            if app and app.strip().lower() in cap_by_app:
-                                ev = evict_app_cap(conn, app.strip().lower(), cap_by_app[app.strip().lower()])
+                                toast("Mother skipped large clip", f"{app} ({len(clip_bytes)} bytes)")
+                            last_digest = digest
+                            time.sleep(interval)
+                            continue
+                        if not allow_secrets and looks_like_secret(clip):
+                            if args.redact:
+                                clip = redact_secrets(clip)
+                            else:
+                                say(MOTHER, "skipped clip that looks like a secret (pattern match). Enable allow_secrets or use --redact.")
+                                if notify_enabled:
+                                    toast("Mother skipped secret-looking clip", app or "unknown")
+                                last_digest = digest
+                                time.sleep(interval)
+                                continue
+
+                        existing_id = get_clip_id_by_hash(conn, digest)
+                        if existing_id:
+                            insert_event(conn, existing_id)
+                            say(MOTHER, f"noted repeat clip #{existing_id}")
+                        else:
+                            # derive a simple title (first line trimmed), optionally summarize
+                            first_line = clip.strip().splitlines()[0] if clip.strip() else ""
+                            if auto_summary_cmd and allow_summary:
+                                maybe = run_helper(auto_summary_cmd, clip, timeout=6.0)
+                                if maybe:
+                                    first_line = maybe
+                            if len(first_line) > 120:
+                                first_line = first_line[:117] + "..."
+                            inserted_id = insert_clip(conn, clip, app=app, window=window, digest=digest, title=first_line, embedder_override=embedder_choice)
+                            if inserted_id:
+                                insert_event(conn, inserted_id)
+                                say(MOTHER, f"saved clip #{inserted_id}")
+                                if notify_enabled:
+                                    toast("Mother saved clip", f"#{inserted_id} from {app}")
+                                if auto_tag_cmd and allow_tags:
+                                    tags_out = run_helper(auto_tag_cmd, clip, timeout=6.0)
+                                    if tags_out:
+                                        # split on comma or whitespace
+                                        parts = [t.strip().lower() for t in re.split(r"[,\s]+", tags_out) if t.strip()]
+                                        for t in parts:
+                                            assign_tag(conn, inserted_id, t)
+                                if app and app.strip().lower() in cap_by_app:
+                                    ev = evict_app_cap(conn, app.strip().lower(), cap_by_app[app.strip().lower()])
+                                    if ev:
+                                        say(MOTHER, f"evicted {ev} old clips for app cap ({app})")
+                                if cap:
+                                    pruned = prune(conn, cap)
+                                    if pruned:
+                                        say(MOTHER, f"pruned {pruned} old clips (cap={cap})")
+                                ev = evict_if_needed(conn, max_db_mb)
                                 if ev:
-                                    say(MOTHER, f"evicted {ev} old clips for app cap ({app})")
-                            if cap:
-                                pruned = prune(conn, cap)
-                                if pruned:
-                                    say(MOTHER, f"pruned {pruned} old clips (cap={cap})")
-                            ev = evict_if_needed(conn, max_db_mb)
-                            if ev:
-                                say(MOTHER, f"evicted {ev} oldest clips to honor db cap {max_db_mb}MB")
-                            # backpressure warnings
-                            if cap:
-                                total = conn.execute("SELECT COUNT(*) AS c FROM clips").fetchone()["c"]
-                                if total and total > 0.9 * cap:
-                                    msg = f"near cap ({total}/{cap}); consider purge"
+                                    say(MOTHER, f"evicted {ev} oldest clips to honor db cap {max_db_mb}MB")
+                                # backpressure warnings
+                                if cap:
+                                    total = conn.execute("SELECT COUNT(*) AS c FROM clips").fetchone()["c"]
+                                    if total and total > 0.9 * cap:
+                                        msg = f"near cap ({total}/{cap}); consider purge"
+                                        say(MOTHER, msg)
+                                        if notify_enabled:
+                                            toast("Mother nearing cap", msg)
+                                size_mb = DB_PATH.stat().st_size / (1024 * 1024) if DB_PATH.exists() else 0
+                                if size_mb > 0.8 * max_db_mb:
+                                    msg = f"DB size {size_mb:.1f}MB near cap {max_db_mb}MB"
                                     say(MOTHER, msg)
                                     if notify_enabled:
-                                        toast("Mother nearing cap", msg)
-                            size_mb = DB_PATH.stat().st_size / (1024 * 1024) if DB_PATH.exists() else 0
-                            if size_mb > 0.8 * max_db_mb:
-                                msg = f"DB size {size_mb:.1f}MB near cap {max_db_mb}MB"
-                                say(MOTHER, msg)
-                                if notify_enabled:
-                                    toast("Mother nearing DB cap", msg)
-                    last_digest = digest
+                                        toast("Mother nearing DB cap", msg)
+                        last_digest = digest
+            except Exception as e:
+                logging.exception(f"Error in watcher loop: {e}")
             time.sleep(interval)
     except KeyboardInterrupt:
         say(MOTHER, "stopped.")
@@ -3469,8 +3474,36 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
             return {}
 
     def log_message(self, format: str, *args) -> None:
-        # Quiet by default
-        return
+        logging.info(f"{self.address_string()} - {format % args}")
+
+    def _check_auth(self) -> bool:
+        if not SECRET_PATH.exists():
+            return True
+        try:
+            expected = SECRET_PATH.read_text().strip()
+        except Exception:
+            return True
+        if not expected:
+            return True
+            
+        auth_header = self.headers.get("Authorization")
+        api_key = self.headers.get("x-api-key")
+        provided = None
+        if auth_header and auth_header.startswith("Bearer "):
+            provided = auth_header[7:].strip()
+        elif api_key:
+            provided = api_key.strip()
+            
+        if not provided:
+            path, _, query = self.path.partition("?")
+            qs = urllib.parse.parse_qs(query)
+            if "api_key" in qs:
+                provided = qs["api_key"][0].strip()
+                
+        if not provided or provided != expected:
+            self._send(401, {"error": "unauthorized"})
+            return False
+        return True
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -3480,6 +3513,18 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
+        if not self._check_auth():
+            return
+        try:
+            self._do_GET_impl()
+        except Exception as e:
+            logging.exception(f"Error in GET {self.path}: {e}")
+            try:
+                self._send(500, {"error": "internal server error"})
+            except Exception:
+                pass
+
+    def _do_GET_impl(self) -> None:
         path, _, query = self.path.partition("?")
         qs = urllib.parse.parse_qs(query)
         conn = self.conn
@@ -3540,6 +3585,18 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
   </div>
   <div id="results"></div>
   <script>
+    const _apiKey = new URLSearchParams(window.location.search).get('api_key') || localStorage.getItem('api_key');
+    if (_apiKey) localStorage.setItem('api_key', _apiKey);
+    const _originalFetch = window.fetch;
+    window.fetch = async (...args) => {
+      const [resource, config] = args;
+      const newConfig = config || {};
+      newConfig.headers = newConfig.headers || {};
+      if (_apiKey) {
+        newConfig.headers['x-api-key'] = _apiKey;
+      }
+      return _originalFetch(resource, newConfig);
+    };
     let lastMode = 'recent';
     let autoTimer = null;
     async function loadTags() {
@@ -4129,6 +4186,18 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        if not self._check_auth():
+            return
+        try:
+            self._do_POST_impl()
+        except Exception as e:
+            logging.exception(f"Error in POST {self.path}: {e}")
+            try:
+                self._send(500, {"error": "internal server error"})
+            except Exception:
+                pass
+
+    def _do_POST_impl(self) -> None:
         path = self.path
         conn = self.conn
         init_db(conn)
@@ -4478,6 +4547,8 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
         self._send(404, {"error": "not found"})
 
     def do_DELETE(self) -> None:
+        if not self._check_auth():
+            return
         path = self.path
         conn = self.conn
         init_db(conn)
@@ -4491,6 +4562,32 @@ class ApiHandler(http.server.BaseHTTPRequestHandler):
                 self._send(400, {"error": "missing app"})
             return
         self._send(404, {"error": "not found"})
+
+
+def cmd_auth(args: argparse.Namespace) -> None:
+    if args.action == "generate":
+        import secrets
+        api_key = secrets.token_hex(32)
+        SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SECRET_PATH.write_text(api_key + "\n")
+        try:
+            os.chmod(SECRET_PATH, 0o600)
+        except Exception:
+            pass
+        say(FATHER, f"Generated new API key. Saved to {SECRET_PATH}")
+        say(FATHER, f"API Key: {api_key}")
+    elif args.action == "show":
+        if SECRET_PATH.exists():
+            say(FATHER, f"Current API Key: {SECRET_PATH.read_text().strip()}")
+            say(FATHER, f"Stored at: {SECRET_PATH}")
+        else:
+            say(FATHER, f"No API key found at {SECRET_PATH}")
+    elif args.action == "revoke":
+        if SECRET_PATH.exists():
+            SECRET_PATH.unlink()
+            say(FATHER, f"Revoked API key. Removed {SECRET_PATH}")
+        else:
+            say(FATHER, "No API key to revoke.")
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -4856,6 +4953,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_launch.add_argument("--remove", action="store_true", help="remove the LaunchAgent file")
     p_launch.set_defaults(func=cmd_install_launchagent)
 
+    p_auth = sub.add_parser("auth", help="manage API key for HTTP server")
+    p_auth.add_argument("action", choices=["generate", "show", "revoke"], help="action to perform")
+    p_auth.set_defaults(func=cmd_auth)
+
     p_serve = sub.add_parser("serve", help="start local HTTP API server")
     p_serve.add_argument("--host", default="127.0.0.1")
     p_serve.add_argument("--port", type=int, default=8765)
@@ -4865,9 +4966,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str]) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
     parser = build_parser()
     args = parser.parse_args(argv)
-    args.func(args)
+    try:
+        args.func(args)
+    except Exception as e:
+        logging.exception(f"Unhandled error in command: {e}")
+        return 1
     return 0
 
 
